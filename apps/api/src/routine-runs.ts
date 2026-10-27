@@ -38,45 +38,21 @@ export async function listRoutineRuns(
     select: {
       id: true,
       botId: true,
-      threadId: true,
-      thread: { select: { groupId: true } },
       status: true,
       createdAt: true,
-      startedAt: true,
-      completedAt: true,
+      updatedAt: true,
     },
     orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-    take: 21,
+    take: 50,
   });
-  const runs = rows.slice(0, 20);
-  const last = runs.at(-1);
-  const nextCursor =
-    rows.length > 20 && last ? { id: last.id, createdAt: last.createdAt.toISOString() } : null;
-  const messages = runs.length
-    ? await prisma.$queryRaw<Array<{ id: string; runId: string; threadId: string }>>(Prisma.sql`
-        SELECT DISTINCT ON (m."runId") m.id, m."runId", m."threadId"
-        FROM messages m
-        INNER JOIN runs r ON r.id = m."runId" AND r."threadId" = m."threadId"
-        INNER JOIN threads t ON t.id = m."threadId"
-        WHERE r.id IN (${Prisma.join(runs.map((run) => run.id))})
-          AND r."spaceId" = ${actor.spaceId} AND r."userId" = ${actor.userId}
-          AND t."spaceId" = ${actor.spaceId} AND t."userId" = ${actor.userId}
-          AND m.role = 'bot'
-        ORDER BY m."runId", m."createdAt" DESC, m.id DESC
-      `)
-    : [];
-  const replyByRun = new Map(messages.map((message) => [message.runId, message.id]));
+
   return {
-    nextCursor,
-    runs: runs.map((run) => ({
-      id: run.id,
-      botId: run.botId,
-      groupId: run.thread.groupId,
-      status: run.status as RoutineRun["status"],
-      createdAt: run.createdAt.toISOString(),
-      startedAt: run.startedAt?.toISOString() ?? null,
-      completedAt: run.completedAt?.toISOString() ?? null,
-      messageId: replyByRun.get(run.id) ?? null,
+    runs: rows.map((row) => ({
+      id: row.id,
+      botId: row.botId,
+      status: row.status as RoutineRun["status"],
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
     })),
   };
 }
