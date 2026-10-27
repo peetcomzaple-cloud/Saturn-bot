@@ -3,3 +3,10 @@ Saturn bot
 Derived from Rakazo. Copyright 2026 Rakazo contributors.
 Rakazo-derived code is distributed under Apache License 2.0; see LICENSE.
 Saturn adaptations and source versions are described in PROVENANCE.md.
+
+Saturn visual code/assets derive from owner-supplied orbiting-star-chat.
+The owner authorized their publication under Apache License 2.0.
+
+OpenBot and Cua portions retain the notices and MIT licenses reproduced in
+THIRD_PARTY_NOTICES_OPENBOT_CUA.md. Bundled fonts retain their own licenses
+in THIRD_PARTY_NOTICES_FONTS.md and third-party-licenses/.
