@@ -1,0 +1,1414 @@
+#!/usr/bin/env python3
+"""Unified Document & Thai OCR Extractor for PDF, DOCX, XLSX, PPTX, ZIP, and Images.
+
+Enforces a shared ExtractionBudget across the entire document tree (including nested ZIPs):
+- Pre-checks declared member sizes and enforces streamed byte ceilings during actual decompression.
+- Bounds nested archive depth, total member count, per-entry bytes, cumulative extracted bytes,
+  spreadsheet rows, PDF pages, and cumulative extracted text output characters.
+- Evaluates both cached and uncached XLSX formulas (SUM, AVERAGE, MIN, MAX, COUNT, cross-sheet refs, arithmetic).
+- Provides stdlib OpenXML fallbacks for DOCX, XLSX, and PPTX when optional Python packages are absent.
+- Distinguishes budget_exceeded, encrypted_document, unsupported_format, corrupt_or_invalid_document,
+  parser_unavailable, and file_not_found; never silently omits pages, rows, or failed archive members.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any
+import xml.etree.ElementTree as ET
+import zipfile
+
+CHUNK_SIZE = 65536
+
+OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+UNSUPPORTED_EXTENSIONS = {
+    ".doc",
+    ".xls",
+    ".ppt",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".tbz2",
+    ".xz",
+    ".txz",
+    ".zst",
+    ".iso",
+    ".dmg",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+    ".dat",
+    ".class",
+    ".pyc",
+    ".wasm",
+    ".sqlite",
+    ".db",
+}
+
+PLAIN_TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".rst",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".jsonl",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".html",
+    ".htm",
+    ".log",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".toml",
+}
+
+
+class EncryptedDocumentError(RuntimeError):
+    """Raised when a document or archive is password-protected or encrypted."""
+
+
+class UnsupportedFormatError(RuntimeError):
+    """Raised when a file format is unsupported for structured text extraction."""
+
+
+class CorruptDocumentError(RuntimeError):
+    """Raised when a document or archive is structurally corrupt or invalid."""
+
+
+class ParserUnavailableError(RuntimeError):
+    """Raised when an external parser/OCR binary required for extraction is unavailable."""
+
+
+@dataclass
+class ExtractionBudget:
+    max_depth: int = 3
+    max_entries: int = 64
+    max_entry_bytes: int = 16 * 1024 * 1024
+    max_total_bytes: int = 32 * 1024 * 1024
+    max_output_chars: int = 120_000
+    max_rows: int = 500
+    max_pages: int = 200
+    entries_seen: int = 0
+    total_bytes_read: int = 0
+    output_chars_emitted: int = 0
+    truncated: bool = False
+    limit_exceeded: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    def record_limit(self, kind: str, message: str) -> None:
+        self.truncated = True
+        if self.limit_exceeded is None:
+            self.limit_exceeded = kind
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    def apply_output_budget(self, text: str, source_label: str) -> str:
+        if not text:
+            return text
+        rem = self.max_output_chars - self.output_chars_emitted
+        if rem <= 0:
+            self.record_limit(
+                "output_char_limit_exceeded",
+                f"Cumulative extracted text output exceeded max_output_chars={self.max_output_chars} before {source_label}",
+            )
+            return (
+                f"[PARTIAL EXTRACTION — BUDGET EXCEEDED (output_char_limit_exceeded): "
+                f"Output limit max_output_chars={self.max_output_chars} reached at {source_label}. "
+                f"Do NOT claim the full document or archive was read.]"
+            )
+        if len(text) > rem:
+            clipped = text[:rem]
+            self.output_chars_emitted += len(clipped)
+            self.record_limit(
+                "output_char_limit_exceeded",
+                f"Extracted text output for {source_label} ({len(text)} chars) exceeded remaining max_output_chars={self.max_output_chars}",
+            )
+            banner = (
+                f"\n\n[PARTIAL EXTRACTION — BUDGET EXCEEDED (output_char_limit_exceeded): "
+                f"Truncated {source_label} at {rem} of {len(text)} chars (max_output_chars={self.max_output_chars}). "
+                f"Do NOT claim the full document or archive was read.]"
+            )
+            return clipped + banner
+        self.output_chars_emitted += len(text)
+        return text
+
+
+def compute_bounded_sha256(path: Path, max_bytes: int = 64 * 1024 * 1024) -> tuple[str | None, int]:
+    size = path.stat().st_size
+    if size > max_bytes:
+        return None, size
+    h = hashlib.sha256()
+    with path.open("rb") as fp:
+        while True:
+            chunk = fp.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest(), size
+
+
+def _check_ole2_header(path: Path) -> None:
+    with path.open("rb") as fp:
+        head = fp.read(65536)
+    if head.startswith(OLE2_MAGIC):
+        if (
+            b"EncryptedPackage" in head
+            or b"EncryptionInfo" in head
+            or b"E\x00n\x00c\x00r\x00y\x00p\x00t\x00e\x00d" in head
+        ):
+            raise EncryptedDocumentError(f"Office document is password-protected/encrypted: {path.name}")
+        raise UnsupportedFormatError(
+            f"Legacy binary OLE2 container is not a valid OpenXML document: {path.name}"
+        )
+
+
+def ocr_image(image_path: Path, lang: str = "tha+eng") -> str:
+    if not shutil.which("tesseract"):
+        raise ParserUnavailableError("OCR parser unavailable: tesseract is not installed")
+    with image_path.open("rb") as fp:
+        magic = fp.read(16)
+    valid_magic = (
+        magic.startswith(b"\x89PNG\r\n\x1a\n")
+        or magic.startswith(b"\xff\xd8\xff")
+        or (magic.startswith(b"RIFF") and magic[8:12] == b"WEBP")
+        or magic.startswith(b"II*\x00")
+        or magic.startswith(b"MM\x00*")
+        or magic.startswith(b"BM")
+    )
+    if not valid_magic:
+        raise CorruptDocumentError(f"Invalid or corrupt image header in {image_path.name}")
+    proc = subprocess.run(
+        ["tesseract", str(image_path), "stdout", "-l", lang],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        err_txt = (proc.stderr or "").strip() or "tesseract OCR failed"
+        if "unavailable" in err_txt.lower() or "failed loading language" in err_txt.lower():
+            raise ParserUnavailableError(err_txt)
+        raise CorruptDocumentError(err_txt)
+    return proc.stdout.strip()
+
+
+def _pdf_bytes_look_encrypted(pdf_path: Path) -> bool:
+    try:
+        with pdf_path.open("rb") as fp:
+            data = fp.read(256 * 1024)
+        return b"/Encrypt" in data
+    except Exception:
+        return False
+
+
+def _normalize_pdf_text(raw: str) -> str:
+    if "\xfe\xff" not in raw:
+        return raw
+    out_lines: list[str] = []
+    for line in raw.splitlines():
+        if "\xfe\xff" in line and all(ord(c) < 256 for c in line):
+            idx = line.find("\xfe\xff")
+            prefix = line[:idx]
+            raw_bytes = line[idx + 2 :].encode("latin-1", errors="ignore")
+            if len(raw_bytes) % 2 == 1:
+                raw_bytes = raw_bytes[:-1]
+            try:
+                decoded = raw_bytes.decode("utf-16-be")
+                out_lines.append(prefix + decoded)
+                continue
+            except Exception:
+                pass
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def extract_pdf(
+    pdf_path: Path,
+    lang: str = "tha+eng",
+    min_chars_per_page: int = 20,
+    budget: ExtractionBudget | None = None,
+) -> dict[str, Any]:
+    if budget is None:
+        budget = ExtractionBudget()
+
+    with pdf_path.open("rb") as fp:
+        head = fp.read(1024)
+    if b"%PDF-" not in head:
+        raise CorruptDocumentError(f"Invalid PDF header in {pdf_path.name}")
+
+    pages_output: list[dict[str, Any]] = []
+    ocr_pages = 0
+    total_pages = 0
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(str(pdf_path))
+        if getattr(reader, "is_encrypted", False):
+            try:
+                dec_res = reader.decrypt("")
+            except Exception as dec_exc:
+                raise EncryptedDocumentError(
+                    f"PDF is password-protected/encrypted: {pdf_path.name}"
+                ) from dec_exc
+            if not dec_res:
+                raise EncryptedDocumentError(f"PDF is password-protected/encrypted: {pdf_path.name}")
+
+        total_pages = len(reader.pages)
+        if total_pages == 0:
+            raise CorruptDocumentError(f"PDF has 0 pages: {pdf_path.name}")
+
+        page_limit = min(total_pages, budget.max_pages)
+        if total_pages > budget.max_pages:
+            budget.record_limit(
+                "pdf_page_limit_exceeded",
+                f"PDF page count ({total_pages}) exceeds max_pages={budget.max_pages} in {pdf_path.name}",
+            )
+
+        for idx in range(1, page_limit + 1):
+            page = reader.pages[idx - 1]
+            try:
+                text = _normalize_pdf_text(page.extract_text() or "").strip()
+            except Exception as page_exc:
+                if "encrypt" in str(page_exc).lower() or "password" in str(page_exc).lower():
+                    raise EncryptedDocumentError(
+                        f"PDF page {idx} is password-protected/encrypted: {pdf_path.name}"
+                    ) from page_exc
+                text = ""
+
+            used_ocr = False
+            if len(text) < min_chars_per_page:
+                if shutil.which("pdftoppm") and shutil.which("tesseract"):
+                    with tempfile.TemporaryDirectory(prefix="rakazo-pdf-ocr-") as tmp:
+                        prefix = Path(tmp) / "page"
+                        subprocess.run(
+                            [
+                                "pdftoppm",
+                                "-png",
+                                "-r",
+                                "200",
+                                "-f",
+                                str(idx),
+                                "-l",
+                                str(idx),
+                                str(pdf_path),
+                                str(prefix),
+                            ],
+                            capture_output=True,
+                            text=True,
+                        )
+                        rendered = sorted(Path(tmp).glob("page*.png"))
+                        if rendered:
+                            try:
+                                ocr_text = ocr_image(rendered[0], lang=lang)
+                            except Exception:
+                                ocr_text = ""
+                            if ocr_text:
+                                text = ocr_text
+                                used_ocr = True
+                                ocr_pages += 1
+
+            missing_page_text = False
+            if not text:
+                missing_page_text = True
+                budget.record_limit(
+                    "pdf_missing_page_text",
+                    f"Page {idx} of {total_pages} in {pdf_path.name} yielded no extractable text and OCR was unavailable or empty",
+                )
+                text = f"[PAGE {idx}: NO EXTRACTABLE TEXT / OCR UNAVAILABLE OR EMPTY]"
+
+            pages_output.append(
+                {
+                    "page": idx,
+                    "ocr": used_ocr,
+                    "missingText": missing_page_text,
+                    "text": text,
+                }
+            )
+    except EncryptedDocumentError:
+        raise
+    except Exception as exc:
+        exc_msg = str(exc)
+        if "password" in exc_msg.lower() or "encrypt" in exc_msg.lower() or _pdf_bytes_look_encrypted(pdf_path):
+            raise EncryptedDocumentError(f"PDF is password-protected/encrypted: {pdf_path.name}") from exc
+        if not shutil.which("pdftotext"):
+            if "no module named" in exc_msg.lower():
+                raise ParserUnavailableError(f"PDF parser unavailable: {exc}") from exc
+            raise CorruptDocumentError(f"Failed to parse PDF {pdf_path.name}: {exc}") from exc
+
+        proc = subprocess.run(["pdftotext", str(pdf_path), "-"], capture_output=True, text=True)
+        if proc.returncode != 0:
+            stderr_msg = (proc.stderr or "").strip()
+            if "password" in stderr_msg.lower() or "encrypted" in stderr_msg.lower():
+                raise EncryptedDocumentError(
+                    f"PDF is password-protected/encrypted: {stderr_msg or pdf_path.name}"
+                ) from exc
+            raise CorruptDocumentError(stderr_msg or f"Failed to parse PDF: {exc}") from exc
+
+        raw_pages = proc.stdout.split("\f")
+        if raw_pages and raw_pages[-1].strip() == "":
+            raw_pages = raw_pages[:-1]
+        if not raw_pages:
+            raw_pages = [proc.stdout.strip()]
+        total_pages = len(raw_pages)
+        page_limit = min(total_pages, budget.max_pages)
+        if total_pages > budget.max_pages:
+            budget.record_limit(
+                "pdf_page_limit_exceeded",
+                f"PDF page count ({total_pages}) exceeds max_pages={budget.max_pages} in {pdf_path.name}",
+            )
+        for idx, p_txt in enumerate(raw_pages[:page_limit], start=1):
+            clean_txt = p_txt.strip()
+            missing_page_text = False
+            if not clean_txt:
+                missing_page_text = True
+                budget.record_limit(
+                    "pdf_missing_page_text",
+                    f"Page {idx} of {total_pages} in {pdf_path.name} yielded no extractable text",
+                )
+                clean_txt = f"[PAGE {idx}: NO EXTRACTABLE TEXT / OCR UNAVAILABLE OR EMPTY]"
+            pages_output.append(
+                {
+                    "page": idx,
+                    "ocr": False,
+                    "missingText": missing_page_text,
+                    "text": clean_txt,
+                }
+            )
+
+    combined = "\n\n".join(f"--- Page {p['page']} ---\n{p['text']}" for p in pages_output)
+    if total_pages > len(pages_output):
+        combined += (
+            f"\n\n[PARTIAL PDF EXTRACTION — BUDGET EXCEEDED (pdf_page_limit_exceeded): "
+            f"Extracted {len(pages_output)} of {total_pages} pages. Do NOT claim the full PDF was read.]"
+        )
+    elif any(p.get("missingText") for p in pages_output):
+        combined += (
+            f"\n\n[PARTIAL PDF EXTRACTION — MISSING PAGE TEXT (pdf_missing_page_text): "
+            f"One or more pages had no extractable text. Do NOT claim all pages were read completely.]"
+        )
+    combined = budget.apply_output_budget(combined, pdf_path.name)
+    return {
+        "path": str(pdf_path),
+        "type": "pdf",
+        "pageCount": total_pages,
+        "extractedPageCount": len(pages_output),
+        "ocrPages": ocr_pages,
+        "text": combined,
+        "pages": pages_output,
+    }
+
+
+def _extract_docx_openxml(docx_path: Path) -> list[str]:
+    W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    try:
+        with zipfile.ZipFile(str(docx_path), "r") as zf:
+            if "word/document.xml" not in zf.namelist():
+                raise CorruptDocumentError(f"Missing word/document.xml in {docx_path.name}")
+            xml_bytes = zf.read("word/document.xml")
+    except zipfile.BadZipFile as exc:
+        raise CorruptDocumentError(f"Corrupt DOCX archive container in {docx_path.name}: {exc}") from exc
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as exc:
+        raise CorruptDocumentError(f"Corrupt XML in {docx_path.name}: {exc}") from exc
+
+    body = root.find(f"{W_NS}body")
+    if body is None:
+        body = root
+
+    blocks: list[str] = []
+    for child in list(body):
+        if child.tag == f"{W_NS}p":
+            runs = [t.text for t in child.iter(f"{W_NS}t") if t.text]
+            line = "".join(runs).strip()
+            if line:
+                blocks.append(line)
+        elif child.tag == f"{W_NS}tbl":
+            for tr in child.findall(f".//{W_NS}tr"):
+                cells: list[str] = []
+                for tc in tr.findall(f"./{W_NS}tc"):
+                    cell_texts = [t.text for t in tc.iter(f"{W_NS}t") if t.text]
+                    cells.append("".join(cell_texts).strip().replace("\n", " "))
+                if any(cells):
+                    blocks.append(" | ".join(cells))
+    return blocks
+
+
+def extract_docx(docx_path: Path, budget: ExtractionBudget | None = None) -> dict[str, Any]:
+    if budget is None:
+        budget = ExtractionBudget()
+    _check_ole2_header(docx_path)
+
+    blocks: list[str] | None = None
+    try:
+        import docx  # type: ignore
+
+        doc = docx.Document(str(docx_path))
+        blocks = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                blocks.append(" | ".join(cells))
+    except ImportError:
+        blocks = _extract_docx_openxml(docx_path)
+    except Exception as exc:
+        try:
+            blocks = _extract_docx_openxml(docx_path)
+        except Exception:
+            if shutil.which("pandoc"):
+                proc = subprocess.run(
+                    ["pandoc", str(docx_path), "-t", "markdown"],
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode == 0:
+                    text = budget.apply_output_budget(proc.stdout.strip(), docx_path.name)
+                    return {"path": str(docx_path), "type": "docx", "text": text}
+            raise CorruptDocumentError(f"Failed to parse DOCX {docx_path.name}: {exc}") from exc
+
+    text = budget.apply_output_budget("\n".join(blocks or []), docx_path.name)
+    return {
+        "path": str(docx_path),
+        "type": "docx",
+        "text": text,
+    }
+
+
+def _col_letters_to_index(col_str: str) -> int:
+    idx = 0
+    for ch in col_str.upper():
+        if "A" <= ch <= "Z":
+            idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def _index_to_col_letters(idx: int) -> str:
+    out = []
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        out.append(chr(ord("A") + rem))
+    return "".join(reversed(out))
+
+
+_CELL_REF_RE = re.compile(r"^(?:(?:'([^']+)'|([A-Za-z0-9_.\u0E00-\u0E7F]+))!)?\$?([A-Za-z]{1,3})\$?(\d+)$")
+
+
+def _parse_cell_ref(ref: str, default_sheet: str) -> tuple[str, int, int] | None:
+    m = _CELL_REF_RE.match(ref.strip())
+    if not m:
+        return None
+    sheet = m.group(1) or m.group(2) or default_sheet
+    col = _col_letters_to_index(m.group(3))
+    row = int(m.group(4))
+    return sheet, row, col
+
+
+def _format_num(val: float | int) -> str:
+    if isinstance(val, int):
+        return str(val)
+    if abs(val - round(val)) < 1e-9:
+        return str(int(round(val)))
+    return f"{val:.6f}".rstrip("0").rstrip(".")
+
+
+def _eval_excel_formula(
+    expr: str,
+    current_sheet: str,
+    cells_map: dict[tuple[str, int, int], dict[str, Any]],
+    visiting: set[tuple[str, int, int]] | None = None,
+) -> float | int | None:
+    if visiting is None:
+        visiting = set()
+    body = expr.strip()
+    if body.startswith("="):
+        body = body[1:].strip()
+    if not body:
+        return None
+
+    def get_numeric_cell(sheet: str, r: int, c: int) -> float | None:
+        key = (sheet, r, c)
+        if key in visiting:
+            return None
+        cell_info = cells_map.get(key)
+        if not cell_info:
+            return 0.0
+        val = cell_info.get("value")
+        if val is not None and str(val).strip() != "":
+            try:
+                return float(str(val).replace(",", ""))
+            except ValueError:
+                pass
+        f_str = cell_info.get("formula")
+        if f_str:
+            visiting.add(key)
+            res = _eval_excel_formula(f_str, sheet, cells_map, visiting)
+            visiting.remove(key)
+            if res is not None:
+                return float(res)
+        return None
+
+    def expand_range(arg_str: str) -> list[float] | None:
+        if ":" in arg_str:
+            left_s, right_s = arg_str.split(":", 1)
+            left_ref = _parse_cell_ref(left_s, current_sheet)
+            if not left_ref:
+                return None
+            right_ref = _parse_cell_ref(right_s, left_ref[0])
+            if not right_ref:
+                return None
+            sh = left_ref[0]
+            r1, r2 = min(left_ref[1], right_ref[1]), max(left_ref[1], right_ref[1])
+            c1, c2 = min(left_ref[2], right_ref[2]), max(left_ref[2], right_ref[2])
+            vals: list[float] = []
+            for r in range(r1, r2 + 1):
+                for c in range(c1, c2 + 1):
+                    v = get_numeric_cell(sh, r, c)
+                    if v is not None:
+                        vals.append(v)
+            return vals
+        single = _parse_cell_ref(arg_str, current_sheet)
+        if single:
+            v = get_numeric_cell(single[0], single[1], single[2])
+            return [v] if v is not None else None
+        try:
+            return [float(arg_str.strip())]
+        except ValueError:
+            return None
+
+    func_re = re.compile(r"\b(SUM|AVERAGE|MIN|MAX|COUNT)\s*\(([^()]*)\)", re.IGNORECASE)
+    while True:
+        m = func_re.search(body)
+        if not m:
+            break
+        fn_name = m.group(1).upper()
+        raw_args = [a.strip() for a in m.group(2).split(",") if a.strip()]
+        collected: list[float] = []
+        for a in raw_args:
+            rng = expand_range(a)
+            if rng is None:
+                return None
+            collected.extend(rng)
+        if fn_name == "SUM":
+            f_val = sum(collected)
+        elif fn_name == "AVERAGE":
+            f_val = (sum(collected) / len(collected)) if collected else 0.0
+        elif fn_name == "MIN":
+            f_val = min(collected) if collected else 0.0
+        elif fn_name == "MAX":
+            f_val = max(collected) if collected else 0.0
+        elif fn_name == "COUNT":
+            f_val = float(len(collected))
+        else:
+            return None
+        body = body[: m.start()] + _format_num(f_val) + body[m.end() :]
+
+    token_re = re.compile(
+        r"(?:'[^']+'|[A-Za-z0-9_.\u0E00-\u0E7F]+)!?" r"\$?[A-Za-z]{1,3}\$?\d+|\$?[A-Za-z]{1,3}\$?\d+"
+    )
+
+    def replace_ref(match: re.Match[str]) -> str:
+        tok = match.group(0)
+        parsed = _parse_cell_ref(tok, current_sheet)
+        if not parsed:
+            raise ValueError(f"Unrecognized reference: {tok}")
+        v = get_numeric_cell(parsed[0], parsed[1], parsed[2])
+        if v is None:
+            raise ValueError(f"Unresolved reference: {tok}")
+        return _format_num(v)
+
+    try:
+        arith_expr = token_re.sub(replace_ref, body)
+    except ValueError:
+        return None
+
+    if not re.fullmatch(r"[\d\s.+\-*/()]+", arith_expr):
+        return None
+    try:
+        val = eval(arith_expr, {"__builtins__": {}}, {})  # noqa: S307
+        if isinstance(val, (int, float)):
+            return int(round(val)) if abs(val - round(val)) < 1e-9 else float(val)
+    except Exception:
+        return None
+    return None
+
+
+def _parse_xlsx_openxml(xlsx_path: Path) -> tuple[list[str], dict[str, list[list[dict[str, Any]]]]]:
+    try:
+        with zipfile.ZipFile(str(xlsx_path), "r") as zf:
+            names = set(zf.namelist())
+            if "xl/workbook.xml" not in names:
+                raise CorruptDocumentError(f"Missing xl/workbook.xml in {xlsx_path.name}")
+
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in names:
+                ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in ss_root.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si"):
+                    texts = [
+                        t.text or ""
+                        for t in si.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")
+                    ]
+                    shared_strings.append("".join(texts))
+
+            rels_map: dict[str, str] = {}
+            if "xl/_rels/workbook.xml.rels" in names:
+                rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+                for rel in rels_root:
+                    r_id = rel.attrib.get("Id", "")
+                    target = rel.attrib.get("Target", "").lstrip("/")
+                    if not target.startswith("xl/"):
+                        target = f"xl/{target}"
+                    rels_map[r_id] = target
+
+            wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+            sheet_entries: list[tuple[str, str]] = []
+            for idx, sh in enumerate(
+                wb_root.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet"),
+                start=1,
+            ):
+                s_name = sh.attrib.get("name", f"Sheet{idx}")
+                r_id = (
+                    sh.attrib.get(
+                        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+                    )
+                    or ""
+                )
+                target = rels_map.get(r_id, f"xl/worksheets/sheet{idx}.xml")
+                sheet_entries.append((s_name, target))
+
+            sheet_names = [s[0] for s in sheet_entries]
+            sheets_rows: dict[str, list[list[dict[str, Any]]]] = {}
+            S_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+            for s_name, target in sheet_entries:
+                if target not in names:
+                    sheets_rows[s_name] = []
+                    continue
+                ws_root = ET.fromstring(zf.read(target))
+                rows_list: list[list[dict[str, Any]]] = []
+                for row_el in ws_root.iter(f"{S_NS}row"):
+                    r_idx_attr = row_el.attrib.get("r")
+                    r_idx = int(r_idx_attr) if (r_idx_attr and r_idx_attr.isdigit()) else (len(rows_list) + 1)
+                    row_cells_by_col: dict[int, dict[str, Any]] = {}
+                    max_col = 0
+                    for c_el in row_el.findall(f"{S_NS}c"):
+                        c_ref = c_el.attrib.get("r", "")
+                        parsed_ref = _parse_cell_ref(c_ref, s_name) if c_ref else None
+                        c_idx = parsed_ref[2] if parsed_ref else (max_col + 1)
+                        max_col = max(max_col, c_idx)
+                        c_type = c_el.attrib.get("t", "")
+                        f_el = c_el.find(f"{S_NS}f")
+                        v_el = c_el.find(f"{S_NS}v")
+                        is_el = c_el.find(f"{S_NS}is")
+                        formula_str = f"={f_el.text.strip()}" if (f_el is not None and f_el.text) else None
+                        val_obj: Any = None
+                        if c_type == "s" and v_el is not None and v_el.text is not None:
+                            s_idx = int(v_el.text)
+                            val_obj = shared_strings[s_idx] if 0 <= s_idx < len(shared_strings) else v_el.text
+                        elif c_type == "inlineStr" and is_el is not None:
+                            val_obj = "".join(t.text or "" for t in is_el.iter(f"{S_NS}t"))
+                        elif c_type == "b" and v_el is not None and v_el.text is not None:
+                            val_obj = "TRUE" if v_el.text == "1" else "FALSE"
+                        elif v_el is not None and v_el.text is not None:
+                            raw_v = v_el.text.strip()
+                            try:
+                                f_v = float(raw_v)
+                                val_obj = _format_num(f_v)
+                            except ValueError:
+                                val_obj = raw_v
+                        row_cells_by_col[c_idx] = {
+                            "row": r_idx,
+                            "col": c_idx,
+                            "value": val_obj,
+                            "formula": formula_str,
+                        }
+                    row_list = [
+                        row_cells_by_col.get(
+                            c_i,
+                            {"row": r_idx, "col": c_i, "value": None, "formula": None},
+                        )
+                        for c_i in range(1, max_col + 1)
+                    ]
+                    rows_list.append(row_list)
+                sheets_rows[s_name] = rows_list
+            return sheet_names, sheets_rows
+    except zipfile.BadZipFile as exc:
+        raise CorruptDocumentError(f"Corrupt XLSX archive container in {xlsx_path.name}: {exc}") from exc
+    except ET.ParseError as exc:
+        raise CorruptDocumentError(f"Corrupt XML in {xlsx_path.name}: {exc}") from exc
+
+
+def extract_xlsx(
+    xlsx_path: Path,
+    max_rows: int | None = None,
+    budget: ExtractionBudget | None = None,
+) -> dict[str, Any]:
+    if budget is None:
+        budget = ExtractionBudget()
+    if max_rows is None:
+        max_rows = budget.max_rows
+    _check_ole2_header(xlsx_path)
+
+    sheet_names, sheets_rows = _parse_xlsx_openxml(xlsx_path)
+    cells_map: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for s_name, rows in sheets_rows.items():
+        for row in rows:
+            for cell in row:
+                cells_map[(s_name, cell["row"], cell["col"])] = cell
+
+    sheets_out: list[str] = []
+    formulas_evaluated = 0
+    for name in sheet_names:
+        rows = sheets_rows.get(name, [])
+        rows_str: list[str] = [f"### Sheet: {name}"]
+        for idx, row in enumerate(rows, start=1):
+            if idx > max_rows:
+                rows_str.append(f"... (truncated after {max_rows} rows)")
+                budget.record_limit(
+                    "xlsx_row_limit_exceeded",
+                    f"Sheet {name} in {xlsx_path.name} exceeded max_rows={max_rows} (total rows={len(rows)})",
+                )
+                break
+            vals: list[str] = []
+            for cell in row:
+                v = cell.get("value")
+                f_str = cell.get("formula")
+                if f_str:
+                    if v is None or str(v).strip() == "":
+                        eval_v = _eval_excel_formula(f_str, name, cells_map)
+                        if eval_v is not None:
+                            v = _format_num(eval_v)
+                            cell["value"] = v
+                            formulas_evaluated += 1
+                    if v is not None and str(v).strip() != "":
+                        vals.append(f"{v} [formula: {f_str}]")
+                    else:
+                        budget.record_limit(
+                            "xlsx_unresolved_formula",
+                            f"Unresolved formula {f_str} at {name}!{_index_to_col_letters(cell['col'])}{cell['row']} in {xlsx_path.name}",
+                        )
+                        vals.append(f"[UNRESOLVED_FORMULA: {f_str}]")
+                else:
+                    vals.append(str(v) if v is not None else "")
+            if any(vals):
+                rows_str.append(" | ".join(vals))
+        sheets_out.append("\n".join(rows_str))
+
+    combined = "\n\n".join(sheets_out)
+    if budget.truncated and budget.limit_exceeded in ("xlsx_row_limit_exceeded", "xlsx_unresolved_formula"):
+        combined += (
+            f"\n\n[PARTIAL XLSX EXTRACTION — {budget.limit_exceeded}: "
+            f"{'; '.join(budget.warnings)}. Do NOT claim all rows or formulas were read completely.]"
+        )
+    combined = budget.apply_output_budget(combined, xlsx_path.name)
+    return {
+        "path": str(xlsx_path),
+        "type": "xlsx",
+        "sheets": sheet_names,
+        "formulasEvaluated": formulas_evaluated,
+        "text": combined,
+    }
+
+
+def _extract_pptx_openxml(pptx_path: Path) -> tuple[int, list[str]]:
+    A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    try:
+        with zipfile.ZipFile(str(pptx_path), "r") as zf:
+            slide_files = sorted(
+                [
+                    n
+                    for n in zf.namelist()
+                    if re.match(r"^ppt/slides/slide\d+\.xml$", n)
+                ],
+                key=lambda s: int(re.findall(r"\d+", s)[0]),
+            )
+            if not slide_files and "ppt/presentation.xml" not in zf.namelist():
+                raise CorruptDocumentError(f"Missing ppt/presentation.xml in {pptx_path.name}")
+            slides_out: list[str] = []
+            for idx, sf in enumerate(slide_files, start=1):
+                root = ET.fromstring(zf.read(sf))
+                lines = [f"### Slide {idx}"]
+                for p_el in root.iter(f"{A_NS}p"):
+                    runs = [t.text or "" for t in p_el.iter(f"{A_NS}t") if t.text]
+                    txt = "".join(runs).strip()
+                    if txt:
+                        lines.append(txt)
+                slides_out.append("\n".join(lines))
+            return len(slide_files), slides_out
+    except zipfile.BadZipFile as exc:
+        raise CorruptDocumentError(f"Corrupt PPTX archive container in {pptx_path.name}: {exc}") from exc
+    except ET.ParseError as exc:
+        raise CorruptDocumentError(f"Corrupt XML in {pptx_path.name}: {exc}") from exc
+
+
+def extract_pptx(pptx_path: Path, budget: ExtractionBudget | None = None) -> dict[str, Any]:
+    if budget is None:
+        budget = ExtractionBudget()
+    _check_ole2_header(pptx_path)
+
+    try:
+        from pptx import Presentation  # type: ignore
+
+        prs = Presentation(str(pptx_path))
+        slides_out: list[str] = []
+        for idx, slide in enumerate(prs.slides, start=1):
+            lines = [f"### Slide {idx}"]
+            for shape in slide.shapes:
+                if getattr(shape, "has_text_frame", False):
+                    txt = shape.text_frame.text.strip()
+                    if txt:
+                        lines.append(txt)
+            slides_out.append("\n".join(lines))
+        slide_count = len(prs.slides)
+    except ImportError:
+        slide_count, slides_out = _extract_pptx_openxml(pptx_path)
+    except Exception as exc:
+        try:
+            slide_count, slides_out = _extract_pptx_openxml(pptx_path)
+        except Exception:
+            raise CorruptDocumentError(f"Failed to parse PPTX {pptx_path.name}: {exc}") from exc
+
+    text = budget.apply_output_budget("\n\n".join(slides_out), pptx_path.name)
+    return {
+        "path": str(pptx_path),
+        "type": "pptx",
+        "slideCount": slide_count,
+        "text": text,
+    }
+
+
+def _is_unsafe_zip_member(filename: str) -> bool:
+    norm = filename.replace("\\", "/")
+    if norm.startswith("/") or re.match(r"^[A-Za-z]:", norm):
+        return True
+    parts = [p for p in norm.split("/") if p]
+    return ".." in parts
+
+
+def extract_zip(
+    zip_path: Path,
+    lang: str = "tha+eng",
+    budget: ExtractionBudget | None = None,
+    depth: int = 0,
+) -> dict[str, Any]:
+    if budget is None:
+        budget = ExtractionBudget()
+
+    if depth > budget.max_depth:
+        msg = f"Archive nesting depth {depth} exceeds max_depth={budget.max_depth} at {zip_path.name}"
+        budget.record_limit("zip_depth_limit_exceeded", msg)
+        banner = (
+            f"[PARTIAL ARCHIVE EXTRACTION — BUDGET EXCEEDED ({budget.limit_exceeded}): "
+            f"{'; '.join(budget.warnings)}. Do NOT claim the full archive was read.]"
+        )
+        return {
+            "ok": False,
+            "errorType": "budget_exceeded",
+            "path": str(zip_path),
+            "type": "zip",
+            "entries": [],
+            "failedEntries": [],
+            "truncated": True,
+            "limitExceeded": budget.limit_exceeded,
+            "warnings": list(budget.warnings),
+            "totalBytesRead": budget.total_bytes_read,
+            "error": banner,
+            "text": banner,
+        }
+
+    entries: list[str] = []
+    failed_entries: list[dict[str, str]] = []
+    parts: list[str] = []
+    try:
+        zf_ctx = zipfile.ZipFile(str(zip_path), "r")
+    except zipfile.BadZipFile as exc:
+        raise CorruptDocumentError(f"Corrupt or invalid ZIP archive {zip_path.name}: {exc}") from exc
+
+    with tempfile.TemporaryDirectory(prefix="rakazo-zip-") as tmpdir, zf_ctx as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            if _is_unsafe_zip_member(info.filename):
+                budget.record_limit(
+                    "zip_unsafe_member_path",
+                    f"Skipped unsafe archive member path: {info.filename}",
+                )
+                failed_entries.append({"entry": info.filename, "errorType": "zip_unsafe_member_path"})
+                parts.append(
+                    f"### Entry: {info.filename} (ERROR: zip_unsafe_member_path)\n"
+                    f"[SKIPPED: unsafe archive member path {info.filename}]"
+                )
+                continue
+
+            if budget.entries_seen >= budget.max_entries:
+                budget.record_limit(
+                    "zip_entry_count_limit_exceeded",
+                    f"Archive member count exceeded max_entries={budget.max_entries} at {info.filename}",
+                )
+                break
+
+            budget.entries_seen += 1
+
+            # Check ZIP general purpose bit 0 for encryption
+            if info.flag_bits & 0x1:
+                budget.record_limit(
+                    "encrypted_document",
+                    f"Archive member {info.filename} is password-protected/encrypted",
+                )
+                failed_entries.append({"entry": info.filename, "errorType": "encrypted_document"})
+                parts.append(
+                    f"### Entry: {info.filename} (ERROR: encrypted_document)\n"
+                    f"[SKIPPED: archive member {info.filename} is password-protected/encrypted]"
+                )
+                continue
+
+            # 1. Pre-read declared metadata check
+            if info.file_size > budget.max_entry_bytes:
+                budget.record_limit(
+                    "zip_entry_size_limit_exceeded",
+                    f"Entry {info.filename} declared size ({info.file_size} bytes) exceeds max_entry_bytes={budget.max_entry_bytes}",
+                )
+                failed_entries.append({"entry": info.filename, "errorType": "budget_exceeded"})
+                parts.append(
+                    f"### Entry: {info.filename}\n"
+                    f"[SKIPPED: declared size {info.file_size} bytes exceeds max_entry_bytes={budget.max_entry_bytes}]"
+                )
+                continue
+
+            if budget.total_bytes_read + info.file_size > budget.max_total_bytes:
+                budget.record_limit(
+                    "zip_total_bytes_limit_exceeded",
+                    f"Entry {info.filename} declared size ({info.file_size} bytes) would exceed cumulative max_total_bytes={budget.max_total_bytes} (already read {budget.total_bytes_read} bytes)",
+                )
+                failed_entries.append({"entry": info.filename, "errorType": "budget_exceeded"})
+                break
+
+            # 2. Streamed read with hard byte ceilings (never trust ZIP header metadata alone)
+            safe_name = Path(info.filename.replace("\\", "/")).name or f"entry_{budget.entries_seen}"
+            member_path = Path(tmpdir) / f"{budget.entries_seen}_{safe_name}"
+            entry_bytes = 0
+            stream_exceeded = False
+            try:
+                with zf.open(info, "r") as src_fp, member_path.open("wb") as dst_fp:
+                    while True:
+                        rem_entry = max(1, (budget.max_entry_bytes - entry_bytes) + 1)
+                        rem_total = max(1, (budget.max_total_bytes - budget.total_bytes_read) + 1)
+                        read_len = min(CHUNK_SIZE, rem_entry, rem_total)
+                        chunk = src_fp.read(read_len)
+                        if not chunk:
+                            break
+                        entry_bytes += len(chunk)
+                        budget.total_bytes_read += len(chunk)
+                        if entry_bytes > budget.max_entry_bytes:
+                            budget.record_limit(
+                                "zip_entry_size_limit_exceeded",
+                                f"Entry {info.filename} decompressed stream ({entry_bytes} bytes) exceeded max_entry_bytes={budget.max_entry_bytes}",
+                            )
+                            stream_exceeded = True
+                            break
+                        if budget.total_bytes_read > budget.max_total_bytes:
+                            budget.record_limit(
+                                "zip_total_bytes_limit_exceeded",
+                                f"Cumulative decompressed stream ({budget.total_bytes_read} bytes) exceeded max_total_bytes={budget.max_total_bytes} while reading {info.filename}",
+                            )
+                            stream_exceeded = True
+                            break
+                        dst_fp.write(chunk)
+            except RuntimeError as z_exc:
+                member_path.unlink(missing_ok=True)
+                err_s = str(z_exc)
+                err_t = (
+                    "encrypted_document"
+                    if "encrypted" in err_s.lower() or "password" in err_s.lower()
+                    else "corrupt_or_invalid_document"
+                )
+                budget.record_limit(err_t, f"Archive member {info.filename} failed: {err_s}")
+                failed_entries.append({"entry": info.filename, "errorType": err_t})
+                parts.append(f"### Entry: {info.filename} (ERROR: {err_t})\n{err_s}")
+                continue
+            except Exception as z_exc:
+                member_path.unlink(missing_ok=True)
+                err_s = str(z_exc)
+                budget.record_limit(
+                    "corrupt_or_invalid_document",
+                    f"Archive member {info.filename} decompression failed: {err_s}",
+                )
+                failed_entries.append({"entry": info.filename, "errorType": "corrupt_or_invalid_document"})
+                parts.append(
+                    f"### Entry: {info.filename} (ERROR: corrupt_or_invalid_document)\n{err_s}"
+                )
+                continue
+
+            if stream_exceeded:
+                member_path.unlink(missing_ok=True)
+                failed_entries.append({"entry": info.filename, "errorType": "budget_exceeded"})
+                if budget.limit_exceeded == "zip_total_bytes_limit_exceeded":
+                    break
+                parts.append(
+                    f"### Entry: {info.filename}\n"
+                    f"[TRUNCATED: decompressed stream exceeded max_entry_bytes={budget.max_entry_bytes}]"
+                )
+                continue
+
+            sub = extract_document(
+                member_path,
+                lang=lang,
+                budget=budget,
+                depth=depth + 1,
+                logical_name=info.filename,
+            )
+            member_path.unlink(missing_ok=True)
+
+            if sub.get("ok") is False:
+                sub_err_type = str(sub.get("errorType") or "corrupt_or_invalid_document")
+                failed_entries.append({"entry": info.filename, "errorType": sub_err_type})
+                budget.record_limit(
+                    sub_err_type,
+                    f"Entry {info.filename} failed extraction ({sub_err_type}): {sub.get('error', '')}",
+                )
+                parts.append(
+                    f"### Entry: {info.filename} (ERROR: {sub_err_type})\n"
+                    f"{sub.get('error', '')}".strip()
+                )
+            else:
+                entries.append(info.filename)
+                parts.append(f"### Entry: {info.filename}\n{sub.get('text', '')}".strip())
+
+            if budget.limit_exceeded in ("zip_total_bytes_limit_exceeded", "output_char_limit_exceeded"):
+                break
+
+    if budget.truncated or failed_entries:
+        budget_kinds = {
+            "zip_depth_limit_exceeded",
+            "zip_entry_count_limit_exceeded",
+            "zip_entry_size_limit_exceeded",
+            "zip_total_bytes_limit_exceeded",
+            "output_char_limit_exceeded",
+            "file_size_limit_exceeded",
+            "xlsx_row_limit_exceeded",
+            "pdf_page_limit_exceeded",
+        }
+        banner_kind = budget.limit_exceeded or "partial_archive_extraction"
+        banner_header = (
+            f"BUDGET EXCEEDED ({banner_kind})"
+            if banner_kind in budget_kinds
+            else f"INCOMPLETE / MEMBER ERRORS ({banner_kind})"
+        )
+        banner = (
+            f"[PARTIAL ARCHIVE EXTRACTION — {banner_header}: "
+            f"{'; '.join(budget.warnings)}. Do NOT claim the full archive was read.]"
+        )
+        combined_text = "\n\n".join(parts + [banner]) if parts else banner
+        if len(entries) == 0:
+            err_types = [fe["errorType"] for fe in failed_entries]
+            if banner_kind in budget_kinds or "budget_exceeded" in err_types:
+                primary_err = "budget_exceeded"
+            elif err_types and all(t == "encrypted_document" for t in err_types):
+                primary_err = "encrypted_document"
+            elif err_types and all(t == "unsupported_format" for t in err_types):
+                primary_err = "unsupported_format"
+            elif err_types and all(t == "parser_unavailable" for t in err_types):
+                primary_err = "parser_unavailable"
+            else:
+                primary_err = "corrupt_or_invalid_document"
+            return {
+                "ok": False,
+                "errorType": primary_err,
+                "path": str(zip_path),
+                "type": "zip",
+                "entries": entries,
+                "failedEntries": failed_entries,
+                "truncated": True,
+                "limitExceeded": budget.limit_exceeded,
+                "warnings": list(budget.warnings),
+                "totalBytesRead": budget.total_bytes_read,
+                "error": banner,
+                "text": combined_text,
+            }
+        return {
+            "ok": True,
+            "path": str(zip_path),
+            "type": "zip",
+            "entries": entries,
+            "failedEntries": failed_entries,
+            "truncated": True,
+            "limitExceeded": budget.limit_exceeded,
+            "warnings": list(budget.warnings),
+            "totalBytesRead": budget.total_bytes_read,
+            "text": combined_text,
+        }
+
+    return {
+        "ok": True,
+        "path": str(zip_path),
+        "type": "zip",
+        "entries": entries,
+        "failedEntries": [],
+        "truncated": False,
+        "limitExceeded": None,
+        "warnings": [],
+        "totalBytesRead": budget.total_bytes_read,
+        "text": "\n\n".join(parts),
+    }
+
+
+def extract_plain_text(path: Path, budget: ExtractionBudget, label: str) -> dict[str, Any]:
+    raw = path.read_bytes()
+    if b"\x00" in raw:
+        raise CorruptDocumentError(f"Binary NUL bytes detected in text file: {label}")
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CorruptDocumentError(f"Invalid UTF-8 text encoding in {label}: {exc}") from exc
+    text = budget.apply_output_budget(decoded, label)
+    return {
+        "path": str(path),
+        "type": "text",
+        "text": text,
+    }
+
+
+def extract_document(
+    path: Path,
+    lang: str = "tha+eng",
+    budget: ExtractionBudget | None = None,
+    depth: int = 0,
+    logical_name: str | None = None,
+) -> dict[str, Any]:
+    if budget is None:
+        budget = ExtractionBudget()
+
+    label = logical_name or path.name
+    if not path.is_file():
+        return {
+            "ok": False,
+            "errorType": "file_not_found",
+            "path": str(path),
+            "type": "missing",
+            "error": f"File not found: {path}",
+        }
+
+    lower_name = label.lower()
+    suffix = Path(label).suffix.lower() or path.suffix.lower()
+    sha256_hex: str | None = None
+    file_size = 0
+    if depth == 0:
+        sha256_hex, file_size = compute_bounded_sha256(
+            path, max_bytes=max(budget.max_total_bytes, 64 * 1024 * 1024)
+        )
+    else:
+        file_size = path.stat().st_size
+
+    try:
+        if lower_name.endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst")) or suffix in UNSUPPORTED_EXTENSIONS:
+            raise UnsupportedFormatError(
+                f"Unsupported document or archive format '{suffix or lower_name}' for {label}"
+            )
+
+        if depth == 0 and suffix != ".zip":
+            if file_size > budget.max_total_bytes:
+                budget.record_limit(
+                    "file_size_limit_exceeded",
+                    f"File size ({file_size} bytes) exceeds max_total_bytes={budget.max_total_bytes}",
+                )
+                return {
+                    "ok": False,
+                    "errorType": "budget_exceeded",
+                    "path": str(path),
+                    "type": suffix.lstrip(".") or "unknown",
+                    "fileSize": file_size,
+                    "sha256": sha256_hex,
+                    "truncated": True,
+                    "limitExceeded": budget.limit_exceeded,
+                    "warnings": list(budget.warnings),
+                    "error": f"File size ({file_size} bytes) exceeds extraction budget ({budget.max_total_bytes} bytes)",
+                }
+
+        if suffix == ".pdf":
+            res = extract_pdf(path, lang=lang, budget=budget)
+        elif suffix == ".docx":
+            res = extract_docx(path, budget=budget)
+        elif suffix in (".xlsx", ".xlsm"):
+            res = extract_xlsx(path, max_rows=budget.max_rows, budget=budget)
+        elif suffix == ".pptx":
+            res = extract_pptx(path, budget=budget)
+        elif suffix == ".zip":
+            res = extract_zip(path, lang=lang, budget=budget, depth=depth)
+        elif suffix in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"):
+            raw_ocr = ocr_image(path, lang=lang)
+            text = budget.apply_output_budget(raw_ocr, label)
+            res = {"path": str(path), "type": "image_ocr", "text": text}
+        elif suffix in PLAIN_TEXT_EXTENSIONS:
+            res = extract_plain_text(path, budget=budget, label=label)
+        else:
+            raise UnsupportedFormatError(
+                f"Unsupported file format '{suffix or 'unknown'}' for {label}"
+            )
+
+        res.setdefault("ok", True)
+        if depth == 0:
+            res.setdefault("fileSize", file_size)
+            res.setdefault("sha256", sha256_hex)
+        res.setdefault("truncated", budget.truncated)
+        res.setdefault("limitExceeded", budget.limit_exceeded)
+        res.setdefault("warnings", list(budget.warnings))
+        return res
+    except EncryptedDocumentError as exc:
+        return {
+            "ok": False,
+            "errorType": "encrypted_document",
+            "path": str(path),
+            "type": suffix.lstrip(".") or "unknown",
+            **({"fileSize": file_size, "sha256": sha256_hex} if depth == 0 else {}),
+            "truncated": budget.truncated,
+            "limitExceeded": budget.limit_exceeded,
+            "warnings": list(budget.warnings),
+            "error": str(exc),
+        }
+    except UnsupportedFormatError as exc:
+        return {
+            "ok": False,
+            "errorType": "unsupported_format",
+            "path": str(path),
+            "type": suffix.lstrip(".") or "unknown",
+            **({"fileSize": file_size, "sha256": sha256_hex} if depth == 0 else {}),
+            "truncated": budget.truncated,
+            "limitExceeded": budget.limit_exceeded,
+            "warnings": list(budget.warnings),
+            "error": str(exc),
+        }
+    except ParserUnavailableError as exc:
+        return {
+            "ok": False,
+            "errorType": "parser_unavailable",
+            "path": str(path),
+            "type": suffix.lstrip(".") or "unknown",
+            **({"fileSize": file_size, "sha256": sha256_hex} if depth == 0 else {}),
+            "truncated": budget.truncated,
+            "limitExceeded": budget.limit_exceeded,
+            "warnings": list(budget.warnings),
+            "error": str(exc),
+        }
+    except Exception as exc:
+        msg = str(exc)
+        err_type = (
+            "parser_unavailable"
+            if "unavailable" in msg.lower() or "no module named" in msg.lower()
+            else "encrypted_document"
+            if "password-protected" in msg.lower() or "encrypted" in msg.lower()
+            else "unsupported_format"
+            if "unsupported" in msg.lower()
+            else "corrupt_or_invalid_document"
+        )
+        return {
+            "ok": False,
+            "errorType": err_type,
+            "path": str(path),
+            "type": suffix.lstrip(".") or "unknown",
+            **({"fileSize": file_size, "sha256": sha256_hex} if depth == 0 else {}),
+            "truncated": budget.truncated,
+            "limitExceeded": budget.limit_exceeded,
+            "warnings": list(budget.warnings),
+            "error": msg,
+        }
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="rakazo-doc-extract",
+        description="Extract structured text and Thai+English OCR from PDF, DOCX, XLSX, PPTX, ZIP, and image files.",
+    )
+    parser.add_argument("files", nargs="+", help="Document, archive, or image file paths to extract.")
+    parser.add_argument("--lang", default="tha+eng", help="Tesseract OCR language pack (default: tha+eng).")
+    parser.add_argument("--format", choices=["json", "markdown"], default="json", help="Output format.")
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=int(os.environ.get("RAKAZO_DOC_EXTRACT_MAX_DEPTH", "3")),
+        help="Maximum nested archive depth (default: 3).",
+    )
+    parser.add_argument(
+        "--max-entries",
+        type=int,
+        default=int(os.environ.get("RAKAZO_DOC_EXTRACT_MAX_ENTRIES", "64")),
+        help="Maximum total archive entries across the document tree (default: 64).",
+    )
+    parser.add_argument(
+        "--max-entry-bytes",
+        type=int,
+        default=int(os.environ.get("RAKAZO_DOC_EXTRACT_MAX_ENTRY_BYTES", str(16 * 1024 * 1024))),
+        help="Maximum bytes per archive entry (default: 16MB).",
+    )
+    parser.add_argument(
+        "--max-total-bytes",
+        type=int,
+        default=int(os.environ.get("RAKAZO_DOC_EXTRACT_MAX_TOTAL_BYTES", str(32 * 1024 * 1024))),
+        help="Maximum cumulative extracted bytes across the document tree (default: 32MB).",
+    )
+    parser.add_argument(
+        "--max-output-chars",
+        type=int,
+        default=int(os.environ.get("RAKAZO_DOC_EXTRACT_MAX_OUTPUT_CHARS", "120000")),
+        help="Maximum cumulative extracted output characters (default: 120000).",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=int(os.environ.get("RAKAZO_DOC_EXTRACT_MAX_ROWS", "500")),
+        help="Maximum rows per spreadsheet sheet before truncation (default: 500).",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=int(os.environ.get("RAKAZO_DOC_EXTRACT_MAX_PAGES", "200")),
+        help="Maximum pages per PDF document before truncation (default: 200).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    budget = ExtractionBudget(
+        max_depth=args.max_depth,
+        max_entries=args.max_entries,
+        max_entry_bytes=args.max_entry_bytes,
+        max_total_bytes=args.max_total_bytes,
+        max_output_chars=args.max_output_chars,
+        max_rows=args.max_rows,
+        max_pages=args.max_pages,
+    )
+    results = [extract_document(Path(f), lang=args.lang, budget=budget, depth=0) for f in args.files]
+    overall_ok = len(results) > 0 and all(bool(item.get("ok")) for item in results)
+    if args.format == "markdown":
+        for item in results:
+            if item.get("ok") is False:
+                err_code = item.get("errorType", "failed")
+                print(f"# {item['path']} (ERROR: {err_code})\n\n{item.get('error', '')}\n")
+            else:
+                trunc_tag = f" [TRUNCATED: {item.get('limitExceeded')}]" if item.get("truncated") else ""
+                print(f"# {item['path']} ({item['type']}){trunc_tag}\n\n{item.get('text', '')}\n")
+    else:
+        print(json.dumps({"ok": overall_ok, "documents": results}, ensure_ascii=False, indent=2))
+    return 0 if overall_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

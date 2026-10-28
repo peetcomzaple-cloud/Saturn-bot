@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!entrypoint.sh
+!controller.py
+!policy.py
+!web/
+!web/**
+!tests/
+!tests/**
+**/__pycache__/
+**/.pytest_cache/

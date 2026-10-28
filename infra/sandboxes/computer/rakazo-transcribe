@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Smart audio chunker and multi-provider API-key transcription CLI (Groq Whisper, OpenAI Whisper, Deepgram Nova-2)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+def redact_secret(text: str, secret: str) -> str:
+    if not text or not secret:
+        return text
+    return text.replace(secret, "[REDACTED]")
+
+
+def split_audio_chunks(input_path: Path, chunk_seconds: int, work_dir: Path) -> list[Path]:
+    effective_sec = max(1, int(chunk_seconds))
+    pattern = work_dir / "chunk_%03d.mp3"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(effective_sec),
+        str(pattern),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return [input_path]
+    chunks = sorted(work_dir.glob("chunk_*.mp3"))
+    return chunks if chunks else [input_path]
+
+
+def build_multipart_body(
+    fields: dict[str, str],
+    file_field: str,
+    file_name: str,
+    file_bytes: bytes,
+    content_type: str = "audio/mpeg",
+) -> tuple[bytes, str]:
+    boundary = f"----RakazoBoundary{uuid.uuid4().hex}"
+    parts: list[bytes] = []
+    for k, v in fields.items():
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+                f"{v}\r\n"
+            ).encode("utf-8")
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{file_name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    parts.append(file_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    ms = int(round(max(0.0, seconds) * 1000))
+    hrs = ms // 3_600_000
+    ms %= 3_600_000
+    mins = ms // 60_000
+    ms %= 60_000
+    secs = ms // 1000
+    ms %= 1000
+    return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
+
+
+def transcribe_whisper_compatible(
+    audio_path: Path,
+    api_key: str,
+    endpoint: str,
+    model: str,
+    language: str,
+) -> dict[str, Any]:
+    fields = {
+        "model": model,
+        "response_format": "verbose_json",
+    }
+    if language:
+        fields["language"] = language
+    body, content_type = build_multipart_body(
+        fields=fields,
+        file_field="file",
+        file_name=audio_path.name,
+        file_bytes=audio_path.read_bytes(),
+    )
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": content_type,
+            "User-Agent": "RakazoTranscribe/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def transcribe_deepgram(
+    audio_path: Path,
+    api_key: str,
+    language: str,
+    endpoint: str = "",
+) -> dict[str, Any]:
+    lang_param = f"&language={language}" if language else "&detect_language=true"
+    base_url = endpoint or f"https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true{lang_param}"
+    req = urllib.request.Request(
+        base_url,
+        data=audio_path.read_bytes(),
+        headers={
+            "Authorization": f"Token {api_key}",
+            "Content-Type": "audio/mpeg",
+            "User-Agent": "RakazoTranscribe/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        raw = json.loads(resp.read().decode("utf-8"))
+    alt = (
+        raw.get("results", {})
+        .get("channels", [{}])[0]
+        .get("alternatives", [{}])[0]
+    )
+    segments = []
+    for utt in raw.get("results", {}).get("utterances", []) or []:
+        segments.append(
+            {
+                "start": float(utt.get("start", 0.0)),
+                "end": float(utt.get("end", 0.0)),
+                "text": str(utt.get("transcript", "")).strip(),
+            }
+        )
+    return {
+        "text": str(alt.get("transcript", "")).strip(),
+        "segments": segments,
+    }
+
+
+def transcribe_file(
+    input_path: Path,
+    provider: str,
+    api_key: str,
+    language: str,
+    chunk_seconds: int,
+    endpoint_override: str = "",
+) -> dict[str, Any]:
+    effective_chunk_sec = max(1, int(chunk_seconds))
+    resolved_endpoint = endpoint_override or os.environ.get("RAKAZO_TRANSCRIBE_ENDPOINT", "")
+    with tempfile.TemporaryDirectory(prefix="rakazo-transcribe-") as tmp:
+        work_dir = Path(tmp)
+        chunks = split_audio_chunks(input_path, effective_chunk_sec, work_dir)
+        full_texts: list[str] = []
+        srt_blocks: list[str] = []
+        failed_chunks: list[dict[str, Any]] = []
+        srt_index = 1
+        offset_sec = 0.0
+
+        for idx, chunk in enumerate(chunks):
+            try:
+                if provider == "groq":
+                    res = transcribe_whisper_compatible(
+                        chunk,
+                        api_key=api_key,
+                        endpoint=resolved_endpoint or "https://api.groq.com/openai/v1/audio/transcriptions",
+                        model="whisper-large-v3",
+                        language=language,
+                    )
+                elif provider == "openai":
+                    res = transcribe_whisper_compatible(
+                        chunk,
+                        api_key=api_key,
+                        endpoint=resolved_endpoint or "https://api.openai.com/v1/audio/transcriptions",
+                        model="whisper-1",
+                        language=language,
+                    )
+                elif provider == "deepgram":
+                    res = transcribe_deepgram(
+                        chunk,
+                        api_key=api_key,
+                        language=language,
+                        endpoint=resolved_endpoint,
+                    )
+                else:
+                    raise ValueError(f"Unsupported provider: {provider}")
+            except Exception as exc:
+                failed_chunks.append(
+                    {
+                        "chunkIndex": idx,
+                        "chunkName": chunk.name,
+                        "error": redact_secret(str(exc), api_key),
+                    }
+                )
+                offset_sec += float(effective_chunk_sec)
+                continue
+
+            chunk_text = str(res.get("text", "")).strip()
+            if chunk_text:
+                full_texts.append(chunk_text)
+
+            segments = res.get("segments") or []
+            for seg in segments:
+                seg_text = str(seg.get("text", "")).strip()
+                if not seg_text:
+                    continue
+                start = offset_sec + float(seg.get("start", 0.0))
+                end = offset_sec + float(seg.get("end", start + 2.0))
+                srt_blocks.append(
+                    f"{srt_index}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{seg_text}\n"
+                )
+                srt_index += 1
+
+            offset_sec += float(effective_chunk_sec)
+
+        txt_path = input_path.with_suffix(".txt")
+        srt_path = input_path.with_suffix(".srt")
+        combined_text = "\n\n".join(full_texts).strip()
+        txt_path.write_text(combined_text + ("\n" if combined_text else ""), encoding="utf-8")
+        srt_path.write_text("\n".join(srt_blocks), encoding="utf-8")
+        file_ok = len(failed_chunks) == 0
+        return {
+            "ok": file_ok,
+            "input": str(input_path),
+            "provider": provider,
+            "chunks": len(chunks),
+            "completedChunks": len(chunks) - len(failed_chunks),
+            "failedChunks": failed_chunks,
+            "txt": str(txt_path),
+            "srt": str(srt_path),
+            "charCount": len(combined_text),
+        }
+
+
+def resolve_provider_and_key(provider_arg: str, api_key_arg: str) -> tuple[str, str]:
+    provider = provider_arg.strip().lower()
+    if api_key_arg:
+        return (provider or "groq"), api_key_arg
+    if provider == "groq" or (not provider and os.environ.get("GROQ_API_KEY")):
+        return "groq", os.environ.get("GROQ_API_KEY", "")
+    if provider == "openai" or (not provider and os.environ.get("OPENAI_API_KEY")):
+        return "openai", os.environ.get("OPENAI_API_KEY", "")
+    if provider == "deepgram" or (not provider and os.environ.get("DEEPGRAM_API_KEY")):
+        return "deepgram", os.environ.get("DEEPGRAM_API_KEY", "")
+    return (provider or "groq"), ""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="rakazo-transcribe",
+        description="Chunk audio/video files and transcribe them via Groq Whisper, OpenAI Whisper, or Deepgram API keys.",
+    )
+    parser.add_argument("inputs", nargs="+", help="Audio/video files or directories to transcribe.")
+    parser.add_argument("--provider", default="", choices=["", "groq", "openai", "deepgram"], help="Transcription API provider.")
+    parser.add_argument("--api-key", default="", help="API key (defaults to GROQ_API_KEY / OPENAI_API_KEY / DEEPGRAM_API_KEY).")
+    parser.add_argument("--lang", default="th", help="Language code (default: th).")
+    parser.add_argument("--chunk-seconds", type=int, default=600, help="Segment duration in seconds (default: 600).")
+    parser.add_argument("--endpoint", default="", help="Optional custom transcription endpoint URL.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    provider, api_key = resolve_provider_and_key(args.provider, args.api_key)
+    if not api_key:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "Missing API key. Pass --api-key or set GROQ_API_KEY / OPENAI_API_KEY / DEEPGRAM_API_KEY.",
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    targets: list[Path] = []
+    missing_inputs: list[str] = []
+    for raw in args.inputs:
+        p = Path(raw)
+        if p.is_dir():
+            found = sorted(p.glob("*.mp3")) + sorted(p.glob("*.mp4")) + sorted(p.glob("*.wav"))
+            if found:
+                targets.extend(found)
+            else:
+                missing_inputs.append(str(p))
+        elif p.is_file():
+            targets.append(p)
+        else:
+            missing_inputs.append(str(p))
+
+    results = []
+    for target in targets:
+        results.append(
+            transcribe_file(
+                input_path=target,
+                provider=provider,
+                api_key=api_key,
+                language=args.lang,
+                chunk_seconds=args.chunk_seconds,
+                endpoint_override=args.endpoint,
+            )
+        )
+    overall_ok = (
+        len(targets) > 0
+        and len(missing_inputs) == 0
+        and all(bool(r.get("ok")) for r in results)
+    )
+    payload: dict[str, Any] = {
+        "ok": overall_ok,
+        "results": results,
+    }
+    if missing_inputs:
+        payload["missingInputs"] = missing_inputs
+        payload["error"] = f"Input path(s) not found or empty: {', '.join(missing_inputs)}"
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if overall_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

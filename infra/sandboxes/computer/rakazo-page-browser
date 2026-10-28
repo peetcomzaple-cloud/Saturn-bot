@@ -1,0 +1,3765 @@
+#!/usr/bin/env python3
+"""Drive the live Chromium on this computer over CDP (stdlib only).
+
+Attaches to the Chrome already showing on DISPLAY. Used by the host
+BrowserProvider. Not a vendor SDK. On failure prints JSON with
+fallback computer_act.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import socket
+import struct
+import sys
+import tempfile
+import time
+import threading
+import urllib.request
+from urllib.parse import urlsplit
+from typing import Any
+
+
+def display_num() -> int:
+    raw = os.environ.get("DISPLAY", ":1")
+    try:
+        return int(str(raw).lstrip(":").split(".")[0] or "1")
+    except ValueError:
+        return 1
+
+
+def cdp_port() -> int:
+    override = os.environ.get("RAKAZO_CDP_PORT")
+    if override:
+        return int(override)
+    # rakazo-browser uses 9221 + display number (:1 -> 9222).
+    return 9221 + display_num()
+
+
+def default_state_file(port: int | None = None) -> str:
+    override = os.environ.get("RAKAZO_BROWSER_STATE_FILE")
+    if override:
+        return override
+    resolved_port = port if port is not None else cdp_port()
+    return os.path.join(tempfile.gettempdir(), f"rakazo-page-browser-state-{resolved_port}.json")
+
+
+def http_get_json(url: str, timeout: float = 5.0) -> Any:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        data = resp.read(1024 * 1024 + 1)
+        if len(data) > 1024 * 1024:
+            raise RuntimeError("CDP discovery response too large")
+        return json.loads(data.decode("utf-8"))
+
+
+def wait_for_cdp(port: int, timeout_s: float = 3.0) -> None:
+    deadline = time.time() + timeout_s
+    last_error = "unreachable"
+    launched = False
+    while time.time() < deadline:
+        try:
+            http_get_json(f"http://127.0.0.1:{port}/json/version", timeout=1.0)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            if (
+                not launched
+                and port > 0
+                and os.path.isfile("/usr/local/bin/rakazo-focus-or-launch")
+            ):
+                launched = True
+                try:
+                    import subprocess
+
+                    subprocess.Popen(
+                        ["/usr/local/bin/rakazo-focus-or-launch", "rakazo-browser"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    deadline = max(deadline, time.time() + 6.0)
+                except Exception:
+                    pass
+            time.sleep(0.25)
+    raise RuntimeError(f"CDP not ready on port {port}: {last_error}")
+
+
+def discover_ws_url(port: int) -> str:
+    version = http_get_json(f"http://127.0.0.1:{port}/json/version")
+    ws = version.get("webSocketDebuggerUrl")
+    if not isinstance(ws, str) or not ws:
+        raise RuntimeError("CDP version endpoint missing webSocketDebuggerUrl")
+    parsed = urlsplit(ws)
+    if parsed.scheme != "ws" or parsed.hostname != "127.0.0.1" or parsed.port != port:
+        raise RuntimeError("Unexpected CDP endpoint")
+    return ws
+
+
+WORLD_NAME = "rakazo-page-browser"
+
+
+class BrowserEvidence:
+    def __init__(self, run_id, execution_id, command, *, now=time.time):
+        self.enabled = self.valid_id(run_id) and self.valid_execution(execution_id)
+        self.run_id, self.execution_id, self.command = run_id, execution_id, command
+        self.now, self.events, self.requests, self.sessions = now, [], {}, {}
+        self.session, self.target, self.incomplete = None, None, False
+        self.started_at = now()
+
+    @staticmethod
+    def valid_id(value):
+        return isinstance(value, str) and 0 < len(value) <= 200 and all(
+            ch.isascii() and (ch.isalnum() or ch in '._:-') for ch in value)
+
+    @staticmethod
+    def valid_execution(value):
+        if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            return False
+        try:
+            return len(value.encode('utf-8')) <= 2048
+        except UnicodeError:
+            return False
+
+    @staticmethod
+    def url_fingerprint(value):
+        # Preserve path and query distinctions, never persist a raw URL or userinfo.
+        parsed = urlsplit(value)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return None
+        host = parsed.hostname.lower()
+        if ':' in host:
+            host = '[' + host + ']'
+        port = parsed.port
+        if port is not None and port != (443 if parsed.scheme == 'https' else 80):
+            host += ':' + str(port)
+        canonical = parsed.scheme.lower() + '://' + host + (parsed.path or '/')
+        if parsed.query:
+            canonical += '?' + parsed.query
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def add(self, method, **fields):
+        if not self.enabled:
+            return
+        if len(self.events) >= 160:
+            self.incomplete = True
+            return
+        self.events.append({'at': self.now(), 'method': method, **fields})
+
+    def reply(self, method, params, result, session):
+        if not self.enabled:
+            return
+        if method == 'Target.attachToTarget':
+            target, sid = params.get('targetId'), result.get('sessionId')
+            if self.valid_id(target) and self.valid_id(sid):
+                self.sessions[sid] = target
+                self.add(method, targetId=target, sessionId=sid)
+        elif method == 'Security.setIgnoreCertificateErrors' and isinstance(params.get('ignore'), bool):
+            self.add(method, ignore=params['ignore'], acknowledged=True)
+
+    def selected(self, session, target):
+        if not self.enabled:
+            return
+        if not self.valid_id(session) or not self.valid_id(target) or self.sessions.get(session) != target:
+            self.incomplete = True
+            return
+        self.session, self.target = session, target
+        self.add('helper.selected', sessionId=session, targetId=target)
+
+    def event(self, message):
+        if not self.enabled:
+            return
+        method, params = message.get('method'), message.get('params')
+        if not isinstance(params, dict):
+            return
+        sid = message.get('sessionId')
+        if method == 'Target.detachedFromTarget':
+            sid = params.get('sessionId')
+        if not self.valid_id(sid) or sid not in self.sessions:
+            return
+        target = self.sessions[sid]
+        if method in ('Inspector.detached', 'Target.detachedFromTarget'):
+            self.add(method, sessionId=sid, targetId=target)
+            return
+        rid = params.get('requestId')
+        if not self.valid_id(rid):
+            return
+        key = (sid, rid)
+        if method == 'Network.requestWillBeSent':
+            request = params.get('request')
+            if not isinstance(request, dict):
+                return
+            # XHR/fetch mutations must remain visible alongside document loads.
+            if params.get('type') != 'Document' and request.get('method') != 'POST':
+                return
+            fingerprint = self.url_fingerprint(request.get('url', ''))
+            verb = request.get('method')
+            if fingerprint and verb in ('GET', 'POST', 'HEAD'):
+                if len(self.requests) >= 80:
+                    self.incomplete = True
+                    return
+                self.requests[key] = (fingerprint, verb)
+                self.add(method, sessionId=sid, targetId=target, requestId=rid,
+                         urlSha256=fingerprint, requestMethod=verb)
+        elif key in self.requests:
+            fingerprint, verb = self.requests[key]
+            fields = dict(sessionId=sid, targetId=target, requestId=rid,
+                          urlSha256=fingerprint, requestMethod=verb)
+            if method == 'Network.responseReceived':
+                response = params.get('response')
+                status = response.get('status') if isinstance(response, dict) else None
+                if isinstance(status, (int, float)) and not isinstance(status, bool) and 100 <= status <= 599:
+                    self.add(method, status=int(status), **fields)
+            elif method == 'Network.loadingFailed':
+                error = params.get('errorText')
+                allowed = ('net::ERR_CERT_AUTHORITY_INVALID', 'net::ERR_CERT_DATE_INVALID',
+                    'net::ERR_NAME_NOT_RESOLVED', 'net::ERR_NAME_RESOLUTION_FAILED',
+                    'net::ERR_CERT_COMMON_NAME_INVALID', 'net::ERR_CONNECTION_CLOSED',
+                    'net::ERR_CONNECTION_RESET', 'net::ERR_CONNECTION_ABORTED',
+                    'net::ERR_TIMED_OUT', 'net::ERR_EMPTY_RESPONSE', 'net::ERR_INTERNET_DISCONNECTED',
+                    'net::ERR_ABORTED')
+                self.add(method, errorCode=error if error in allowed else 'OTHER', **fields)
+
+    def transport_failed(self, session):
+        # One websocket owns all these sessions, including browser-level RPCs.
+        selected = self.session
+        if selected in self.sessions:
+            self.add('transport.closed', sessionId=selected, targetId=self.sessions[selected])
+        else:
+            self.incomplete = True
+
+    def finish(self, result):
+        if not self.enabled:
+            return None
+        ok = isinstance(result, dict) and result.get('ok') is True and not result.get('error')
+        if (self.command == 'snapshot' and (not isinstance(result, dict) or result.get('targetId') != self.target)) or (
+            isinstance(result, dict) and result.get('targetId') is not None and result['targetId'] != self.target):
+            self.incomplete = True
+        if self.session and self.target:
+            self.add('helper.result', sessionId=self.session, targetId=self.target, ok=bool(ok))
+        else:
+            self.incomplete = True
+        return {'version': 1, 'runId': self.run_id, 'executionId': self.execution_id,
+                'command': self.command, 'startedAt': self.started_at, 'completedAt': self.now(),
+                'complete': not self.incomplete, 'events': self.events}
+
+
+def evidence_call(client, method, *args):
+    evidence = getattr(client, '_evidence', None)
+    if evidence is not None:
+        try:
+            getattr(evidence, method)(*args)
+        except Exception:
+            # Instrumentation must not alter tool behavior; incomplete evidence cannot qualify.
+            evidence.incomplete = True
+
+
+def print_browser_result(result, evidence):
+    if evidence is not None:
+        try:
+            envelope = evidence.finish(result)
+            if envelope is not None:
+                result = {**result, '_browserEvidence': envelope}
+        except Exception:
+            result = {**result, '_browserEvidence': {'version': 1, 'complete': False}}
+    print(json.dumps(result))
+
+
+class CdpClient:
+    def __init__(self, ws_url: str, *, state_file: str | None = None) -> None:
+        self._evidence = None
+        self._ws_url = ws_url
+        self._state_file = state_file
+        self._sock: socket.socket | None = None
+        self._buf = bytearray()
+        self._next_id = 1
+        self.context_id: int | None = None
+        self._pending: dict[int, dict[str, Any] | None] = {}
+        # Worlds live in Chromium until navigation; rediscover them per CLI process.
+        self._contexts: dict[int, dict[str, Any]] = {}
+        self._document_requests: dict[tuple[str, str], dict[str, Any]] = {}
+        self._document_responses: dict[str, list[dict[str, Any]]] = {}
+        self._document_failures: dict[str, list[dict[str, Any]]] = {}
+        self._api_responses: dict[str, list[dict[str, Any]]] = {}
+        self._harvested_apis: list[dict[str, Any]] = []
+        self._downloads: dict[str, dict[str, Any]] = {}
+        self._download_seq: int = 0
+        self._active_target_id: str | None = None
+        self._active_browser_context_id: str | None = None
+        self._active_frame_id: str | None = None
+        self._active_frame_ids: set[str] = set()
+        self._active_download_dir: str | None = None
+        self._session_targets: dict[str, dict[str, str]] = {}
+        self._opener_map: dict[str, str] = {}
+        self._target_generations: dict[str, int] = {}
+        self._target_history: list[dict[str, Any]] = []
+        self._stale_ref_rejections: list[dict[str, Any]] = []
+        self._session_to_target: dict[str, str] = {}
+        if self._state_file:
+            self.load_persisted_state()
+
+    def load_persisted_state(self) -> None:
+        if not self._state_file or not os.path.isfile(self._state_file):
+            return
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                return
+            # Cua-inspired generation boundary: a reused port is not browser identity.
+            # Unknown/legacy state must be observed afresh, never attributed to this browser.
+            if data.get("browserEndpoint") != self._ws_url:
+                return
+            seq = data.get("downloadSeq")
+            if isinstance(seq, int) and not isinstance(seq, bool) and seq > self._download_seq:
+                self._download_seq = seq
+            downloads = data.get("downloads")
+            if isinstance(downloads, dict):
+                for guid, info in downloads.items():
+                    if isinstance(guid, str) and guid and isinstance(info, dict):
+                        self._downloads[guid] = dict(info)
+                        for seq_key in ("seq", "updatedSeq"):
+                            entry_seq = info.get(seq_key)
+                            if (
+                                isinstance(entry_seq, int)
+                                and not isinstance(entry_seq, bool)
+                                and entry_seq > self._download_seq
+                            ):
+                                self._download_seq = entry_seq
+            apis = data.get("harvestedApis")
+            if isinstance(apis, list):
+                self._harvested_apis = [dict(a) for a in apis[-50:] if isinstance(a, dict)]
+            active_tid = data.get("activeTargetId")
+            if isinstance(active_tid, str) and active_tid:
+                self._active_target_id = active_tid
+            opener_map = data.get("openerMap")
+            if isinstance(opener_map, dict):
+                self._opener_map = {
+                    str(k): str(v)
+                    for k, v in opener_map.items()
+                    if isinstance(k, str) and k and isinstance(v, str) and v
+                }
+            target_gens = data.get("targetGenerations")
+            if isinstance(target_gens, dict):
+                self._target_generations = {
+                    str(k): int(v)
+                    for k, v in target_gens.items()
+                    if isinstance(k, str) and k and isinstance(v, int)
+                }
+            history = data.get("targetHistory")
+            if isinstance(history, list):
+                self._target_history = [dict(h) for h in history[-100:] if isinstance(h, dict)]
+            rejections = data.get("staleRefRejections")
+            if isinstance(rejections, list):
+                self._stale_ref_rejections = [dict(r) for r in rejections[-50:] if isinstance(r, dict)]
+        except Exception:
+            pass
+
+    def save_persisted_state(self) -> None:
+        if not self._state_file:
+            return
+        try:
+            parent = os.path.dirname(self._state_file)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp_path = f"{self._state_file}.{os.getpid()}.tmp"
+            payload = {
+                "browserEndpoint": self._ws_url,
+                "downloadSeq": self._download_seq,
+                "downloads": self._downloads,
+                "harvestedApis": self._harvested_apis[-50:],
+                "activeTargetId": self._active_target_id,
+                "openerMap": self._opener_map,
+                "targetGenerations": self._target_generations,
+                "targetHistory": self._target_history[-100:],
+                "staleRefRejections": self._stale_ref_rejections[-50:],
+            }
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp_path, self._state_file)
+        except Exception:
+            pass
+
+    def connect(self) -> None:
+        assert self._ws_url.startswith("ws://"), self._ws_url
+        rest = self._ws_url[len("ws://") :]
+        host_port, _, path = rest.partition("/")
+        if ":" in host_port:
+            host, port_s = host_port.split(":", 1)
+            port = int(port_s)
+        else:
+            host, port = host_port, 80
+        path = "/" + path
+        sock = socket.create_connection((host, port), timeout=10)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host_port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        sock.sendall(req.encode("ascii"))
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("CDP websocket handshake closed")
+            data += chunk
+            if len(data) > 16_384:
+                raise RuntimeError("CDP handshake too large")
+        header, _, leftover = data.partition(b"\r\n\r\n")
+        if b"101" not in header.split(b"\r\n", 1)[0]:
+            raise RuntimeError(f"CDP websocket upgrade failed: {header[:200]!r}")
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        )
+        if expected not in header:
+            raise RuntimeError("CDP websocket accept mismatch")
+        self._sock = sock
+        self._buf.extend(leftover)
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def _send_frame(self, payload: bytes) -> None:
+        assert self._sock is not None
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        header = bytearray([0x81])
+        n = len(payload)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", n))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", n))
+        header.extend(mask)
+        self._sock.sendall(header + masked)
+
+    def _send_control(self, opcode: int, payload: bytes) -> None:
+        assert self._sock is not None
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        header = bytearray([0x80 | opcode, 0x80 | len(payload)])
+        header.extend(mask)
+        self._sock.sendall(header + masked)
+
+    def _read_more(self) -> None:
+        assert self._sock is not None
+        chunk = self._sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("CDP websocket closed")
+        self._buf.extend(chunk)
+
+    def _read_frame(self) -> bytes:
+        assert self._sock is not None
+        while True:
+            while len(self._buf) < 2:
+                chunk = self._sock.recv(65536)
+                if not chunk:
+                    raise RuntimeError("CDP websocket closed")
+                self._buf.extend(chunk)
+            b1, b2 = self._buf[0], self._buf[1]
+            opcode = b1 & 0x0F
+            masked = bool(b2 & 0x80)
+            length = b2 & 0x7F
+            offset = 2
+            if length == 126:
+                while len(self._buf) < 4:
+                    self._read_more()
+                length = struct.unpack("!H", self._buf[2:4])[0]
+                offset = 4
+            elif length == 127:
+                while len(self._buf) < 10:
+                    self._read_more()
+                length = struct.unpack("!Q", self._buf[2:10])[0]
+                offset = 10
+            if length > 2 * 1024 * 1024:
+                raise RuntimeError("CDP frame too large")
+            if not (b1 & 0x80):
+                raise RuntimeError("Fragmented CDP message unsupported")
+            mask = b""
+            if masked:
+                while len(self._buf) < offset + 4:
+                    self._read_more()
+                mask = bytes(self._buf[offset : offset + 4])
+                offset += 4
+            while len(self._buf) < offset + length:
+                chunk = self._sock.recv(65536)
+                if not chunk:
+                    raise RuntimeError("CDP websocket closed while reading frame")
+                self._buf.extend(chunk)
+            payload = bytes(self._buf[offset : offset + length])
+            del self._buf[: offset + length]
+            if masked:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:
+                raise RuntimeError("CDP websocket closed by peer")
+            if opcode == 0x9:
+                self._send_control(0xA, payload)
+                continue
+            if opcode in (0x1, 0x2, 0x0):
+                return payload
+
+    def _handle_event(self, message: dict[str, Any]) -> None:
+        evidence_call(self, "event", message)
+        method = message.get("method")
+        params = message.get("params") or {}
+        session_id = message.get("sessionId")
+        sid = str(session_id or "")
+        if method == "Runtime.executionContextCreated":
+            context = params.get("context")
+            if not isinstance(context, dict):
+                return
+            context_id = context.get("id")
+            if not isinstance(context_id, int):
+                return
+            recorded = dict(context)
+            recorded["_sessionId"] = session_id
+            self._contexts[context_id] = recorded
+        elif method == "Runtime.executionContextDestroyed":
+            context_id = params.get("executionContextId")
+            if isinstance(context_id, int):
+                self._contexts.pop(context_id, None)
+        elif method == "Runtime.executionContextsCleared":
+            if session_id is None:
+                self._contexts.clear()
+            else:
+                self._contexts = {
+                    cid: ctx
+                    for cid, ctx in self._contexts.items()
+                    if ctx.get("_sessionId") != session_id
+                }
+        elif method == "Network.requestWillBeSent":
+            req_id = str(params.get("requestId") or "")
+            if not req_id:
+                return
+            is_doc = params.get("type") == "Document" or (sid, req_id) in self._document_requests
+            if not is_doc:
+                return
+            req_obj = params.get("request") or {}
+            req_url = str(req_obj.get("url") or "") if isinstance(req_obj, dict) else ""
+            entry = self._document_requests.setdefault(
+                (sid, req_id),
+                {
+                    "requestId": req_id,
+                    "loaderId": params.get("loaderId"),
+                    "frameId": params.get("frameId"),
+                    "url": req_url,
+                    "redirectChain": [],
+                },
+            )
+            if params.get("loaderId"):
+                entry["loaderId"] = params.get("loaderId")
+            if params.get("frameId"):
+                entry["frameId"] = params.get("frameId")
+            redirect_resp = params.get("redirectResponse")
+            if isinstance(redirect_resp, dict):
+                redir_status = redirect_resp.get("status")
+                entry["redirectChain"].append(
+                    {
+                        "url": str(redirect_resp.get("url") or entry.get("url") or ""),
+                        "status": int(redir_status)
+                        if isinstance(redir_status, int) and not isinstance(redir_status, bool)
+                        else 0,
+                    }
+                )
+            if req_url:
+                entry["url"] = req_url
+        elif method == "Network.responseReceived":
+            res_type = params.get("type")
+            req_id = str(params.get("requestId") or "")
+            response = params.get("response") or {}
+            if not isinstance(response, dict):
+                return
+            raw_status = response.get("status")
+            status_val = (
+                int(raw_status)
+                if isinstance(raw_status, int) and not isinstance(raw_status, bool) and raw_status > 0
+                else None
+            )
+            if res_type in ("XHR", "Fetch"):
+                mime = str(response.get("mimeType") or "").lower()
+                resp_url = str(response.get("url") or "")
+                if "json" in mime or resp_url.endswith(".json") or "/api/" in resp_url or "/_api/" in resp_url or "graph.microsoft.com" in resp_url:
+                    self._api_responses.setdefault(sid, []).append(
+                        {
+                            "requestId": req_id,
+                            "url": resp_url,
+                            "status": status_val,
+                            "mimeType": mime,
+                        }
+                    )
+                return
+            if res_type != "Document":
+                return
+            req_entry = self._document_requests.get((sid, req_id)) or {}
+            headers = response.get("headers") if isinstance(response.get("headers"), dict) else {}
+            self._document_responses.setdefault(sid, []).append(
+                {
+                    "requestId": req_id,
+                    "loaderId": params.get("loaderId") or req_entry.get("loaderId"),
+                    "frameId": params.get("frameId") or req_entry.get("frameId"),
+                    "url": str(response.get("url") or req_entry.get("url") or ""),
+                    "status": status_val,
+                    "headers": headers,
+                    "redirectChain": list(req_entry.get("redirectChain") or []),
+                }
+            )
+        elif method == "Browser.downloadWillBegin":
+            guid = str(params.get("guid") or "").strip()
+            if guid:
+                self._download_seq += 1
+                session_meta = self._session_targets.get(sid) or {}
+                frame_id = str(
+                    params.get("frameId")
+                    or session_meta.get("frameId")
+                    or self._active_frame_id
+                    or ""
+                )
+                target_id = str(
+                    params.get("targetId")
+                    or session_meta.get("targetId")
+                    or self._active_target_id
+                    or ""
+                )
+                browser_context_id = str(
+                    params.get("browserContextId")
+                    or session_meta.get("browserContextId")
+                    or self._active_browser_context_id
+                    or ""
+                )
+                download_dir = str(
+                    params.get("downloadDir")
+                    or self._active_download_dir
+                    or os.environ.get("RAKAZO_DOWNLOAD_DIR")
+                    or ""
+                )
+                entry: dict[str, Any] = {
+                    "guid": guid,
+                    "url": str(params.get("url") or ""),
+                    "suggestedFilename": str(params.get("suggestedFilename") or "download"),
+                    "state": "inProgress",
+                    "seq": self._download_seq,
+                    "updatedSeq": self._download_seq,
+                }
+                if frame_id:
+                    entry["frameId"] = frame_id
+                if target_id:
+                    entry["targetId"] = target_id
+                if browser_context_id:
+                    entry["browserContextId"] = browser_context_id
+                if download_dir:
+                    entry["downloadDir"] = download_dir
+                self._downloads[guid] = entry
+                self.save_persisted_state()
+        elif method == "Browser.downloadProgress":
+            guid = str(params.get("guid") or "").strip()
+            if guid:
+                self._download_seq += 1
+                entry = self._downloads.setdefault(
+                    guid,
+                    {"guid": guid, "seq": self._download_seq},
+                )
+                entry["updatedSeq"] = self._download_seq
+                entry["state"] = str(params.get("state") or entry.get("state") or "inProgress")
+                if isinstance(params.get("receivedBytes"), int) and not isinstance(
+                    params.get("receivedBytes"), bool
+                ):
+                    entry["receivedBytes"] = int(params["receivedBytes"])
+                if isinstance(params.get("totalBytes"), int) and not isinstance(
+                    params.get("totalBytes"), bool
+                ):
+                    entry["totalBytes"] = int(params["totalBytes"])
+                if params.get("filePath"):
+                    entry["filePath"] = str(params["filePath"])
+                session_meta = self._session_targets.get(sid) or {}
+                for meta_key, fallback_val in (
+                    (
+                        "frameId",
+                        params.get("frameId")
+                        or session_meta.get("frameId")
+                        or self._active_frame_id,
+                    ),
+                    (
+                        "targetId",
+                        params.get("targetId")
+                        or session_meta.get("targetId")
+                        or self._active_target_id,
+                    ),
+                    (
+                        "browserContextId",
+                        params.get("browserContextId")
+                        or session_meta.get("browserContextId")
+                        or self._active_browser_context_id,
+                    ),
+                    (
+                        "downloadDir",
+                        params.get("downloadDir")
+                        or self._active_download_dir
+                        or os.environ.get("RAKAZO_DOWNLOAD_DIR"),
+                    ),
+                ):
+                    if not entry.get(meta_key) and isinstance(fallback_val, str) and fallback_val:
+                        entry[meta_key] = fallback_val
+                self.save_persisted_state()
+        elif method == "Network.loadingFailed":
+            req_id = str(params.get("requestId") or "")
+            req_entry = self._document_requests.get((sid, req_id))
+            if params.get("type") != "Document" and req_entry is None:
+                return
+            self._document_failures.setdefault(sid, []).append(
+                {
+                    "requestId": req_id,
+                    "loaderId": params.get("loaderId") or (req_entry or {}).get("loaderId"),
+                    "frameId": params.get("frameId") or (req_entry or {}).get("frameId"),
+                    "errorText": str(params.get("errorText") or "Network loading failed"),
+                    "canceled": bool(params.get("canceled")),
+                }
+            )
+
+    def find_world_context(self, world_name: str, frame_id: str, session_id: str) -> int | None:
+        for context_id, context in self._contexts.items():
+            if context.get("name") != world_name:
+                continue
+            if context.get("_sessionId") != session_id:
+                continue
+            aux = context.get("auxData") or {}
+            if not isinstance(aux, dict) or aux.get("frameId") != frame_id or aux.get("isDefault") is not False:
+                continue
+            return context_id
+        return None
+
+    def call(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        assert self._sock is not None
+        msg_id = self._next_id
+        self._next_id += 1
+        payload: dict[str, Any] = {"id": msg_id, "method": method, "params": params or {}}
+        if session_id:
+            payload["sessionId"] = session_id
+        self._pending[msg_id] = None
+        try:
+            self._send_frame(json.dumps(payload).encode("utf-8"))
+        except (ConnectionError, OSError):
+            evidence_call(self, "transport_failed", session_id)
+            raise
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            pending = self._pending.get(msg_id)
+            if pending is not None:
+                self._pending.pop(msg_id, None)
+                if "error" in pending:
+                    raise RuntimeError(f"{method} failed: {pending['error']}")
+                result = pending.get("result")
+                result = result if isinstance(result, dict) else {}
+                evidence_call(self, "reply", method, params or {}, result, session_id)
+                return result
+            self._sock.settimeout(max(0.1, deadline - time.time()))
+            try:
+                frame = self._read_frame()
+            except socket.timeout:
+                continue
+            except (ConnectionError, OSError, RuntimeError) as exc:
+                if isinstance(exc, (ConnectionError, OSError)) or "websocket closed" in str(exc):
+                    evidence_call(self, "transport_failed", session_id)
+                raise
+            message = json.loads(frame.decode("utf-8"))
+            if not isinstance(message, dict):
+                continue
+            if message.get("id") in self._pending:
+                self._pending[int(message["id"])] = message
+                continue
+            if message.get("method"):
+                self._handle_event(message)
+        raise TimeoutError(f"CDP call timed out: {method}")
+
+
+CLOSED_SHADOW_INIT_SCRIPT = r"""
+(() => {
+  if (window.__rakazoClosedShadows) return;
+  window.__rakazoClosedShadows = new WeakSet();
+  const orig = Element.prototype.attachShadow;
+  if (orig) {
+    Element.prototype.attachShadow = function(init) {
+      if (init && init.mode === "closed") {
+        window.__rakazoClosedShadows.add(this);
+        try { this.setAttribute("data-rakazo-closed-shadow", "1"); } catch {}
+      }
+      return orig.call(this, init);
+    };
+  }
+})();
+"""
+
+
+def attach_page(client: CdpClient) -> str:
+    targets = client.call("Target.getTargets").get("targetInfos") or []
+    pages = [t for t in targets if isinstance(t, dict) and t.get("type") == "page"]
+    if not pages:
+        try:
+            created = client.call("Target.createTarget", {"url": "about:blank"})
+            if isinstance(created, dict) and created.get("targetId"):
+                pages = [{"targetId": created["targetId"], "type": "page", "url": "about:blank"}]
+        except Exception:
+            pass
+    candidates = []
+    session_by_tid: dict[str, str] = {}
+    opener_map = getattr(client, "_opener_map", None)
+    session_to_target = getattr(client, "_session_to_target", None)
+    attached_sessions: list[str] = []
+    failed_target_ids: set[str] = set()
+    for page in pages[:32]:
+        tid = str(page.get("targetId") or "")
+        opener_tid = str(page.get("openerId") or "")
+        if tid and opener_tid and isinstance(opener_map, dict):
+            opener_map[tid] = opener_tid
+        attached = client.call("Target.attachToTarget", {
+            "targetId": page["targetId"], "flatten": True,
+        })
+        session_id = attached["sessionId"]
+        attached_sessions.append(session_id)
+        if tid:
+            session_by_tid[tid] = session_id
+            if isinstance(session_to_target, dict):
+                session_to_target[session_id] = tid
+        if isinstance(getattr(client, "_session_targets", None), dict):
+            client._session_targets[session_id] = {
+                "targetId": str(page.get("targetId") or ""),
+                "browserContextId": str(page.get("browserContextId") or ""),
+            }
+        try:
+            client.call("Page.enable", session_id=session_id, timeout_s=3.0)
+            client.call("Network.enable", session_id=session_id)
+            try:
+                client.call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": CLOSED_SHADOW_INIT_SCRIPT},
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
+            ensure_world(client, session_id)
+            info = eval_json(
+                client,
+                session_id,
+                '({visible: document.visibilityState === "visible", focused: document.hasFocus(), isPopup: Boolean(window.opener)})',
+            )
+            if isinstance(info, dict) and info.get("visible"):
+                candidates.append((session_id, bool(info.get("focused")), bool(info.get("isPopup"))))
+            elif info is True:
+                focused = eval_json(client, session_id, "document.hasFocus()")
+                candidates.append((session_id, bool(focused), False))
+        except Exception:
+            # An attachment is not proof that its renderer is responsive.
+            failed_target_ids.add(tid)
+            session_by_tid.pop(tid, None)
+            attached_sessions.remove(session_id)
+            continue
+    preferred_tid = getattr(client, "_active_target_id", None)
+    if preferred_tid in failed_target_ids:
+        raise RuntimeError("Selected browser target is unresponsive; refusing another tab")
+    if (
+        isinstance(preferred_tid, str)
+        and preferred_tid not in session_by_tid
+        and isinstance(opener_map, dict)
+    ):
+        opener_of_closed = opener_map.get(preferred_tid)
+        if isinstance(opener_of_closed, str) and opener_of_closed in session_by_tid:
+            preferred_tid = opener_of_closed
+    focused = [session for session, focus, _is_popup in candidates if focus]
+    popups = [session for session, _focus, is_popup in candidates if is_popup]
+    if isinstance(preferred_tid, str) and preferred_tid in session_by_tid:
+        selected = session_by_tid[preferred_tid]
+    elif len(focused) == 1:
+        selected = focused[0]
+    elif len(candidates) == 1:
+        selected = candidates[0][0]
+    elif len(popups) == 1:
+        selected = popups[0]
+    elif candidates and isinstance(opener_map, dict) and opener_map:
+        selected = candidates[-1][0]
+    elif len(attached_sessions) == 1:
+        selected = attached_sessions[0]
+        try:
+            client.call("Page.bringToFront", session_id=selected)
+        except Exception:
+            pass
+    else:
+        raise RuntimeError("No unambiguous visible browser tab. Use desktop tools to select a tab.")
+    if isinstance(session_to_target, dict) and selected in session_to_target:
+        client._active_target_id = session_to_target[selected]
+    if isinstance(getattr(client, "_session_targets", None), dict):
+        selected_meta = client._session_targets.get(selected) or {}
+        if selected_meta.get("targetId"):
+            client._active_target_id = selected_meta["targetId"]
+        if selected_meta.get("browserContextId"):
+            client._active_browser_context_id = selected_meta["browserContextId"]
+    ensure_world(client, selected)
+    try:
+        client.call("Security.setIgnoreCertificateErrors", {"ignore": False}, session_id=selected)
+    except Exception:
+        pass
+    download_dir = os.environ.get("RAKAZO_DOWNLOAD_DIR") or os.path.expanduser("~/Downloads")
+    client._active_download_dir = download_dir
+    behavior_params: dict[str, Any] = {
+        "behavior": "allow",
+        "downloadPath": download_dir,
+        "eventsEnabled": True,
+    }
+    if isinstance(getattr(client, "_active_browser_context_id", None), str) and client._active_browser_context_id:
+        behavior_params["browserContextId"] = client._active_browser_context_id
+    try:
+        client.call("Browser.setDownloadBehavior", behavior_params)
+    except Exception:
+        if "browserContextId" in behavior_params:
+            try:
+                fallback_params = {k: v for k, v in behavior_params.items() if k != "browserContextId"}
+                client.call("Browser.setDownloadBehavior", fallback_params)
+            except Exception:
+                pass
+    return selected
+
+
+def record_target_observation(
+    client: Any,
+    target_id: str | None,
+    url: str,
+    title: str,
+    dom_gen: int | None = None,
+    snap_gen: int | None = None,
+) -> None:
+    if not target_id:
+        return
+    opener_map = getattr(client, "_opener_map", None)
+    opener_id = opener_map.get(target_id) if isinstance(opener_map, dict) else None
+    history = getattr(client, "_target_history", None)
+    if isinstance(history, list):
+        entry = {
+            "targetId": target_id,
+            "openerTargetId": opener_id,
+            "url": url,
+            "title": title,
+            "domGeneration": dom_gen,
+            "snapshotGeneration": snap_gen,
+            "ts": round(time.time(), 3),
+        }
+        if not history or history[-1].get("targetId") != target_id or history[-1].get("url") != url or history[-1].get("domGeneration") != dom_gen:
+            history.append(entry)
+
+
+def list_browser_tabs(client: Any, active_session_id: str | None = None) -> list[dict[str, Any]]:
+    if not hasattr(client, "call"):
+        return []
+    try:
+        targets = client.call("Target.getTargets").get("targetInfos") or []
+    except Exception:
+        return []
+    pages = [t for t in targets if isinstance(t, dict) and t.get("type") == "page"]
+    active_tid = getattr(client, "_active_target_id", None)
+    session_to_target = getattr(client, "_session_to_target", None)
+    if active_session_id and isinstance(session_to_target, dict) and active_session_id in session_to_target:
+        active_tid = session_to_target[active_session_id]
+    opener_map = getattr(client, "_opener_map", None)
+    target_gens = getattr(client, "_target_generations", None)
+    tabs: list[dict[str, Any]] = []
+    for page in pages[:32]:
+        tid = str(page.get("targetId") or "")
+        if not tid:
+            continue
+        opener_tid = str(page.get("openerId") or "") or (
+            opener_map.get(tid) if isinstance(opener_map, dict) else ""
+        )
+        if opener_tid and isinstance(opener_map, dict):
+            opener_map[tid] = opener_tid
+        tab_entry: dict[str, Any] = {
+            "targetId": tid,
+            "openerTargetId": opener_tid or None,
+            "url": str(page.get("url") or ""),
+            "title": str(page.get("title") or ""),
+            "active": bool(tid == active_tid),
+        }
+        if isinstance(target_gens, dict) and tid in target_gens:
+            tab_entry["snapshotGeneration"] = target_gens[tid]
+        tabs.append(tab_entry)
+    return tabs
+
+list_open_tabs = list_browser_tabs
+
+
+def _collect_frame_tree_ids(tree_node: Any) -> set[str]:
+    out: set[str] = set()
+    if not isinstance(tree_node, dict):
+        return out
+    frame = tree_node.get("frame")
+    if isinstance(frame, dict) and isinstance(frame.get("id"), str) and frame["id"]:
+        out.add(frame["id"])
+    children = tree_node.get("childFrames")
+    if isinstance(children, list):
+        for child in children:
+            out.update(_collect_frame_tree_ids(child))
+    return out
+
+
+def ensure_world(client: CdpClient, session_id: str) -> None:
+    # Rediscover only an isolated context bound to this frame and CDP session.
+    # Never run helpers in a page-owned default context with the same name.
+    frame_tree = client.call("Page.getFrameTree", session_id=session_id)["frameTree"]
+    frame = frame_tree["frame"]
+    frame_id = frame["id"]
+    if isinstance(frame_id, str) and frame_id:
+        client._active_frame_id = frame_id
+        client._active_frame_ids = _collect_frame_tree_ids(frame_tree)
+        if isinstance(getattr(client, "_session_targets", None), dict):
+            client._session_targets.setdefault(session_id, {})["frameId"] = frame_id
+    client.call("Runtime.enable", session_id=session_id)
+    existing = client.find_world_context(WORLD_NAME, frame_id, session_id)
+    if existing is not None:
+        client.context_id = existing
+        return
+    world = client.call("Page.createIsolatedWorld", {
+        "frameId": frame_id, "worldName": WORLD_NAME,
+    }, session_id=session_id)
+    client.context_id = world["executionContextId"]
+
+
+EVAL_HELPERS = r"""
+(() => {
+  const HELPER_VERSION = "3.0.0";
+  const existing = window.__rakazoPageBrowser;
+  if (existing) {
+    if (existing._isDispatching) return true;
+    if (existing.version === HELPER_VERSION) return true;
+  }
+
+  if (!window.__rakazoClosedShadows) {
+    window.__rakazoClosedShadows = new WeakSet();
+    const origAttachShadow = Element.prototype.attachShadow;
+    if (origAttachShadow) {
+      Element.prototype.attachShadow = function(init) {
+        if (init && init.mode === "closed") {
+          window.__rakazoClosedShadows.add(this);
+          try { this.setAttribute("data-rakazo-closed-shadow", "1"); } catch {}
+        }
+        return origAttachShadow.call(this, init);
+      };
+    }
+  }
+
+  const loginFilled = (existing && existing._loginFilled) || new WeakSet();
+  const refMap = new Map();
+  const docState = (existing && existing._docState) || {
+    snapshotGeneration: 0,
+    domGeneration: 0,
+    knownRefs: new Map(),
+    rejectedStaleRefs: [],
+    observerInstalled: false,
+  };
+
+  if (!docState.observerInstalled && typeof MutationObserver !== "undefined" && document.body) {
+    try {
+      const obs = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === "childList" && (m.addedNodes.length > 0 || m.removedNodes.length > 0)) {
+            docState.domGeneration += 1;
+            break;
+          }
+        }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+      docState.observerInstalled = true;
+    } catch {}
+  }
+
+  function currentDomGeneration() {
+    const pageGen = typeof window.domGen === "number" && Number.isFinite(window.domGen) ? window.domGen : 0;
+    return Math.max(docState.domGeneration, pageGen);
+  }
+
+  function newRef() {
+    return `e${Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16).padStart(8, "0")).join("")}`;
+  }
+
+  function visible(el) {
+    if (!el || el.nodeType !== 1 || typeof el.getBoundingClientRect !== "function") return false;
+    const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const style = win.getComputedStyle ? win.getComputedStyle(el) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function isDisabled(el) {
+    let cur = el;
+    while (cur) {
+      if (
+        (cur.hasAttribute && cur.hasAttribute("disabled")) ||
+        (cur.getAttribute && cur.getAttribute("aria-disabled") === "true") ||
+        (cur.matches && cur.matches(":disabled")) ||
+        cur.disabled === true
+      ) {
+        return true;
+      }
+      cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host);
+    }
+    return false;
+  }
+
+  function roleOf(el) {
+    const explicit = el.getAttribute("role");
+    if (explicit) return explicit;
+    const tag = el.tagName.toLowerCase();
+    if (tag === "a") return "link";
+    if (tag === "button") return "button";
+    if (tag === "input") {
+      const type = (el.getAttribute("type") || "text").toLowerCase();
+      if (type === "submit" || type === "button") return "button";
+      if (type === "checkbox") return "checkbox";
+      if (type === "radio") return "radio";
+      return "textbox";
+    }
+    if (tag === "textarea" || el.isContentEditable) return "textbox";
+    if (tag === "select") return "combobox";
+    if (/^h[1-6]$/.test(tag)) return "heading";
+    return tag;
+  }
+
+  function nameOf(el) {
+    const labelledBy = el.getAttribute("aria-labelledby");
+    if (labelledBy) {
+      const ids = labelledBy.split(/\s+/).filter(Boolean);
+      const root = el.getRootNode ? el.getRootNode() : null;
+      const doc = el.ownerDocument || document;
+      const texts = ids.map(id => {
+        const target = (root && root.getElementById ? root.getElementById(id) : null) || (doc.getElementById ? doc.getElementById(id) : null);
+        return target ? (target.innerText || target.textContent || "").trim() : "";
+      }).filter(Boolean);
+      if (texts.length) return texts.join(" ");
+    }
+    return (
+      el.getAttribute("aria-label") ||
+      Array.from(el.labels || []).map(label => label.textContent).join(" ").trim() ||
+      el.getAttribute("placeholder") ||
+      el.getAttribute("name") ||
+      el.getAttribute("title") ||
+      (el.innerText || el.textContent || "").trim().slice(0, 80) ||
+      ""
+    );
+  }
+
+  function contextOf(el, ownName) {
+    let cur = el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      const tag = cur.tagName ? cur.tagName.toLowerCase() : "";
+      const role = cur.getAttribute ? (cur.getAttribute("role") || "") : "";
+      const cls = typeof cur.className === "string" ? cur.className : "";
+      if (
+        ["tr", "li", "article", "section", "dd", "dt"].includes(tag) ||
+        ["row", "listitem", "region", "group", "article"].includes(role) ||
+        /(?:row|item|card|entry|candidate|module)/i.test(cls) ||
+        (cur.id && /(?:item|row|card|cand|mod)/i.test(cur.id))
+      ) {
+        let raw = (cur.innerText || cur.textContent || "").replace(/\s+/g, " ").trim();
+        if (ownName && raw.includes(ownName)) {
+          raw = raw.replace(ownName, "").replace(/\s+/g, " ").trim();
+        }
+        if (raw && raw.length >= 2) {
+          return raw.slice(0, 100);
+        }
+      }
+      cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+    }
+    return "";
+  }
+
+  function isInteractive(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName.toLowerCase();
+    if (["a", "button", "input", "textarea", "select", "summary"].includes(tag)) return true;
+    if (el.isContentEditable) return true;
+    const role = el.getAttribute("role");
+    if (
+      role &&
+      ["button", "link", "textbox", "checkbox", "radio", "menuitem", "tab", "option", "switch", "searchbox", "combobox"].includes(
+        role
+      )
+    ) {
+      return true;
+    }
+    return typeof el.onclick === "function" || el.hasAttribute("tabindex");
+  }
+
+  function containsAcrossShadow(ancestor, descendant) {
+    if (!ancestor || !descendant) return false;
+    let cur = descendant;
+    while (cur) {
+      if (cur === ancestor) return true;
+      if (ancestor.contains && ancestor.contains(cur)) return true;
+      cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+    }
+    return false;
+  }
+
+  function detectElementOcclusion(el) {
+    const ownerDoc = el.ownerDocument || document;
+    if (!ownerDoc || typeof ownerDoc.elementFromPoint !== "function") return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 800;
+    if (cx < 0 || cy < 0 || cx > vw || cy > vh) return null;
+    const topEl = ownerDoc.elementFromPoint(cx, cy);
+    if (!topEl) return null;
+    let shadowTop = topEl;
+    while (shadowTop && shadowTop.shadowRoot && shadowTop.shadowRoot.elementFromPoint) {
+      const inner = shadowTop.shadowRoot.elementFromPoint(cx, cy);
+      if (!inner || inner === shadowTop) break;
+      shadowTop = inner;
+    }
+    const isSameOrContained =
+      topEl === el ||
+      shadowTop === el ||
+      containsAcrossShadow(el, topEl) ||
+      containsAcrossShadow(topEl, el) ||
+      containsAcrossShadow(el, shadowTop) ||
+      containsAcrossShadow(shadowTop, el);
+    if (isSameOrContained) return null;
+    const modalContainer =
+      (topEl.closest &&
+        topEl.closest(
+          '[role="dialog"], [aria-modal="true"], dialog[open], [id*="modal"], [id*="overlay"], [id*="cookie"], [class*="modal"], [class*="overlay"]'
+        )) ||
+      null;
+    let blockerNode = modalContainer;
+    if (!blockerNode) {
+      let cur = topEl;
+      const win = (ownerDoc && ownerDoc.defaultView) || window;
+      while (cur && cur !== ownerDoc.body && cur !== ownerDoc.documentElement) {
+        if (containsAcrossShadow(cur, el)) break;
+        const st = win && win.getComputedStyle ? win.getComputedStyle(cur) : null;
+        const r = cur.getBoundingClientRect ? cur.getBoundingClientRect() : null;
+        if (
+          st &&
+          (st.position === "fixed" || st.position === "absolute") &&
+          r &&
+          r.width >= 150 &&
+          r.height >= 60
+        ) {
+          blockerNode = cur;
+          break;
+        }
+        cur = cur.parentElement;
+      }
+    }
+    if (!blockerNode) return null;
+    const desc = `${blockerNode.tagName.toLowerCase()}${blockerNode.id ? `#${blockerNode.id}` : ""}`;
+    return { topDesc: `${topEl.tagName.toLowerCase()}${topEl.id ? `#${topEl.id}` : ""}`, blockerDesc: desc, blockerNode };
+  }
+
+  function detectActiveModalOverlay() {
+    const selectors = [
+      '[role="dialog"]',
+      '[aria-modal="true"]',
+      'dialog[open]',
+      '[id*="modal-overlay"]',
+      '[id*="cookie-modal"]',
+      '[id*="modal"]',
+      '[class*="modal-overlay"]',
+    ];
+    for (const sel of selectors) {
+      const nodes = document.querySelectorAll ? Array.from(document.querySelectorAll(sel)) : [];
+      for (const node of nodes) {
+        if (!visible(node)) continue;
+        const win = (node.ownerDocument && node.ownerDocument.defaultView) || window;
+        const style = win.getComputedStyle ? win.getComputedStyle(node) : null;
+        const rect = node.getBoundingClientRect();
+        const isOverlay =
+          node.getAttribute("role") === "dialog" ||
+          node.getAttribute("aria-modal") === "true" ||
+          node.tagName.toLowerCase() === "dialog" ||
+          (style && (style.position === "fixed" || style.position === "absolute") && rect.width >= 200 && rect.height >= 100);
+        if (isOverlay) {
+          const desc = `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ""}`;
+          return { node, desc };
+        }
+      }
+    }
+    return null;
+  }
+
+  function formatTree(elements, includeRef = true) {
+    if (!elements.length) return "(no interactive elements)";
+    return elements
+      .map((el) => {
+        const value =
+          el.value !== undefined && el.value !== "" ? ` value=${JSON.stringify(el.value)}` : "";
+        const refStr = includeRef && el.ref ? ` [${el.ref}]` : "";
+        const ctxStr = el.context ? ` (in: ${JSON.stringify(el.context)})` : "";
+        const modalStr = el.isModal ? " [modal]" : "";
+        const occStr = el.occludedBy ? ` [occluded by ${el.occludedBy}]` : "";
+        return `- ${el.role} "${el.name}"${refStr}${value}${ctxStr}${modalStr}${occStr}`;
+      })
+      .join("\n");
+  }
+
+  function scanElements() {
+    const candidates = [];
+    const seen = new Set();
+    let hasFrames = false;
+    let hasClosedShadow = false;
+    const frameTexts = [];
+    const shadowTexts = [];
+    const activeModalInfo = detectActiveModalOverlay();
+    let detectedBlockerDesc = activeModalInfo ? activeModalInfo.desc : null;
+
+    function walk(root, inShadow = false, inFrame = false) {
+      const nodes = root.querySelectorAll ? Array.from(root.querySelectorAll("*")) : [];
+      for (const el of nodes) {
+        if (
+          (window.__rakazoClosedShadows && window.__rakazoClosedShadows.has(el)) ||
+          (el.getAttribute && (el.getAttribute("data-rakazo-closed-shadow") === "1" || el.getAttribute("data-shadow-mode") === "closed"))
+        ) {
+          hasClosedShadow = true;
+        }
+        if (el.shadowRoot) {
+          const sText = (el.shadowRoot.innerText || el.shadowRoot.textContent || "").replace(/\s+/g, " ").trim();
+          if (sText) shadowTexts.push(`[Shadow DOM]: ${sText}`);
+          walk(el.shadowRoot, true, inFrame);
+        }
+        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+        if (tag === "iframe" || tag === "frame") {
+          if (visible(el)) {
+            try {
+              const doc = el.contentDocument;
+              const childCount = doc && doc.body && doc.body.children ? doc.body.children.length : 0;
+              if (doc && doc.body) {
+                const fText = (doc.body.innerText || doc.body.textContent || "").trim();
+                if (fText) frameTexts.push(fText);
+                if (!fText && childCount === 0) {
+                  hasFrames = true;
+                } else {
+                  walk(doc.body, inShadow, true);
+                }
+              } else {
+                hasFrames = true;
+              }
+            } catch {
+              hasFrames = true;
+            }
+          }
+          continue;
+        }
+        if (!isInteractive(el) || !visible(el)) continue;
+
+        if (el.shadowRoot && el.shadowRoot.querySelector && el.shadowRoot.querySelector("button, input, a, textarea, select")) {
+          continue;
+        }
+
+        if (seen.has(el)) continue;
+        seen.add(el);
+
+        let name = nameOf(el);
+        const host = el.getRootNode && el.getRootNode().host;
+        if (!name && host) {
+          name = nameOf(host);
+        }
+
+        const disabled = isDisabled(el);
+        const role = roleOf(el);
+        const occ = detectElementOcclusion(el);
+        if (occ && !detectedBlockerDesc) {
+          detectedBlockerDesc = occ.blockerDesc;
+        }
+        const insideActiveModal = Boolean(
+          activeModalInfo && activeModalInfo.node && containsAcrossShadow(activeModalInfo.node, el)
+        );
+        candidates.push({
+          node: el,
+          role,
+          name: String(name).slice(0, 200),
+          value: el.type === "password" || loginFilled.has(el) ? undefined
+            : ["checkbox", "radio"].includes(el.type) ? (el.checked ? "checked" : "unchecked")
+            : "value" in el ? String(el.value ?? "").slice(0, 2000)
+            : el.isContentEditable ? String(el.innerText || el.textContent || "").trim().slice(0, 2000)
+            : undefined,
+          tag,
+          ...(disabled ? { disabled: true } : {}),
+          ...(inShadow ? { inShadowDom: true } : {}),
+          ...(inFrame ? { inIframe: true } : {}),
+          ...(insideActiveModal ? { isModal: true } : {}),
+          ...(occ ? { occluded: true, occludedBy: occ.blockerDesc } : {}),
+        });
+        if (candidates.length >= 400) break;
+      }
+    }
+
+    walk(document.body || document, false, false);
+
+    // Disambiguate repeated (role, name) pairs using nearest row/card/item container context
+    const sigCounts = new Map();
+    for (const item of candidates) {
+      const sig = `${item.role}:${(item.name || "").toLowerCase()}`;
+      sigCounts.set(sig, (sigCounts.get(sig) || 0) + 1);
+    }
+    const sigSeen = new Map();
+    for (const item of candidates) {
+      const sig = `${item.role}:${(item.name || "").toLowerCase()}`;
+      if ((sigCounts.get(sig) || 0) > 1) {
+        const idx = (sigSeen.get(sig) || 0) + 1;
+        sigSeen.set(sig, idx);
+        const ctx = contextOf(item.node, item.name);
+        item.context = ctx ? `${ctx} (#${idx})` : `#${idx}`;
+      }
+    }
+
+    let rawElements = candidates;
+    if (candidates.length > 80) {
+      const formRoles = new Set(["textbox", "combobox", "searchbox", "checkbox", "radio", "switch"]);
+      const bySig = new Map();
+      candidates.forEach((item, idx) => {
+        if (!formRoles.has(item.role) && item.name) {
+          const sig = `${item.role}:${item.name}:${item.context || ""}`;
+          if (!bySig.has(sig)) bySig.set(sig, []);
+          bySig.get(sig).push(idx);
+        }
+      });
+      const skipIndices = new Set();
+      for (const indices of bySig.values()) {
+        if (indices.length > 4) {
+          for (let i = 2; i < indices.length - 2; i++) {
+            skipIndices.add(indices[i]);
+          }
+        }
+      }
+      const deduped = candidates.filter((_, idx) => !skipIndices.has(idx));
+      if (deduped.length <= 120) {
+        rawElements = deduped;
+      } else {
+        const mustKeep = new Set();
+        deduped.forEach((item, idx) => {
+          if (formRoles.has(item.role) || ["input", "textarea", "select"].includes(item.tag)) {
+            mustKeep.add(idx);
+          }
+        });
+        for (let idx = deduped.length - 1; idx >= 0 && mustKeep.size < 40; idx--) {
+          mustKeep.add(idx);
+        }
+        for (let idx = 0; idx < deduped.length && mustKeep.size < 120; idx++) {
+          mustKeep.add(idx);
+        }
+        rawElements = deduped.filter((_, idx) => mustKeep.has(idx));
+      }
+    }
+
+    const hasChallengeDom = Boolean(
+      document.querySelector &&
+      document.querySelector(
+        '#challenge-running, #challenge-form, #cf-challenge-running, [name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"], iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .cf-turnstile, .g-recaptcha, .h-captcha'
+      )
+    );
+    const hasMfaInput = Boolean(
+      document.querySelector &&
+      document.querySelector(
+        'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i], input[id*="otp" i], input[id*="mfa" i], input[name*="totp" i], input[id*="totp" i]'
+      )
+    );
+    const challengeType = hasChallengeDom
+      ? "bot_challenge"
+      : hasMfaInput
+        ? "mfa_challenge"
+        : undefined;
+
+    return {
+      rawElements,
+      hasFrames,
+      hasClosedShadow,
+      frameTexts,
+      shadowTexts,
+      isModal: Boolean(detectedBlockerDesc),
+      activeModal: detectedBlockerDesc || undefined,
+      challengeDetected: Boolean(challengeType),
+      challengeType,
+    };
+  }
+
+  function extractPageText(frameTexts, shadowTexts = []) {
+    const raw = (document.body?.innerText || document.body?.textContent || "");
+    const shadowPart = shadowTexts.length ? "\n" + shadowTexts.join("\n").slice(0, 2000) : "";
+    const framePart = frameTexts.length ? "\n" + frameTexts.join("\n").slice(0, 4000) : "";
+    const extra = shadowPart + framePart;
+    const combined = raw + extra;
+    const docEl = document.documentElement || document.body;
+    const scrollHeight = docEl?.scrollHeight || 0;
+    const viewportHeight = window.innerHeight || 800;
+    const scrollY = window.scrollY || 0;
+    if (combined.length <= 16000) {
+      return {
+        text: combined,
+        truncated: false,
+        totalTextLength: combined.length,
+        scrollY,
+        scrollHeight,
+        viewportHeight,
+      };
+    }
+    const maxScroll = Math.max(1, (scrollHeight || 1) - viewportHeight);
+    const scrollRatio = Math.min(1, Math.max(0, scrollY / maxScroll));
+    let sliced = "";
+    if (scrollRatio > 0.15 && scrollRatio < 0.85) {
+      const midCenter = Math.floor(raw.length * scrollRatio);
+      const midStart = Math.max(4000, midCenter - 3000);
+      const midEnd = Math.min(raw.length - 5000, midStart + 6000);
+      if (midEnd > midStart) {
+        sliced =
+          raw.slice(0, 4000) +
+          "\n...[truncated]...\n" +
+          raw.slice(midStart, midEnd) +
+          "\n...[truncated]...\n" +
+          raw.slice(-5000) +
+          extra.slice(0, 2000);
+      }
+    }
+    if (!sliced) {
+      sliced = raw.slice(0, 7000) + "\n...[truncated]...\n" + raw.slice(-7000) + extra.slice(0, 2000);
+    }
+    return {
+      text: sliced,
+      truncated: true,
+      totalTextLength: combined.length,
+      scrollY,
+      scrollHeight,
+      viewportHeight,
+    };
+  }
+
+  function detectContentStatus() {
+    const ready = document.readyState || "unknown";
+    const bodyText = (document.body?.innerText || document.body?.textContent || "").trim();
+    const spaStatusEl = document.getElementById ? document.getElementById("spa-status") : null;
+    const spaStatusText = spaStatusEl ? (spaStatusEl.innerText || spaStatusEl.textContent || "").trim() : "";
+    const hasBusyIndicator = Boolean(
+      (document.querySelector && document.querySelector('ion-loading, [aria-busy="true"], [data-loading="true"]')) ||
+      /^(กำลังโหลด|loading\.\.\.)/i.test(spaStatusText)
+    );
+    if (ready !== "complete" || hasBusyIndicator) {
+      return "partial_loading";
+    }
+    if (!bodyText) {
+      return "empty";
+    }
+    return "complete";
+  }
+
+  const api = {
+    version: "3.0.0",
+    _loginFilled: loginFilled,
+    _refMap: refMap,
+    _docState: docState,
+    _isDispatching: false,
+
+    snapshot() {
+      docState.snapshotGeneration += 1;
+      const snapGen = docState.snapshotGeneration;
+      const domGen = currentDomGeneration();
+      refMap.clear();
+      const { rawElements, hasFrames, hasClosedShadow, frameTexts, shadowTexts, isModal, activeModal, challengeDetected, challengeType } = scanElements();
+      const elements = rawElements.map(item => {
+        const ref = newRef();
+        refMap.set(ref, item.node);
+        docState.knownRefs.set(ref, {
+          snapshotGeneration: snapGen,
+          domGeneration: domGen,
+          role: item.role,
+          name: item.name,
+        });
+        const { node, ...rest } = item;
+        return { ref, ...rest };
+      });
+      const coverage = (hasFrames || hasClosedShadow) ? 0.75 : 1.0;
+      let notes = "";
+      if (isModal && activeModal) {
+        notes += `\n[Active Modal/Overlay: ${activeModal} — dismiss or complete modal before interacting with occluded background elements.]`;
+      }
+      if (hasFrames) notes += "\nEmbedded frames require desktop tools.";
+      if (hasClosedShadow) notes += "\nClosed Shadow DOM components require desktop tools.";
+      const extracted = extractPageText(frameTexts, shadowTexts);
+      if (extracted.truncated) {
+        notes += `\n[Document Truncated: showing excerpts of ${extracted.totalTextLength} total characters.]`;
+      }
+      const contentStatus = detectContentStatus();
+      if (contentStatus === "partial_loading") {
+        notes += "\n[Warning: Page content is still loading (partial_loading).]";
+      }
+
+      return {
+        url: location.href,
+        title: (document.title || "").slice(0, 200),
+        elements,
+        tree: extracted.text + "\n" + formatTree(elements, true) + notes,
+        hasFrames,
+        hasClosedShadow,
+        coverage,
+        isModal,
+        ...(activeModal ? { activeModal } : {}),
+        snapshotGeneration: snapGen,
+        domGeneration: domGen,
+        readyState: document.readyState || "unknown",
+        contentStatus,
+        truncated: extracted.truncated,
+        totalTextLength: extracted.totalTextLength,
+        scrollY: extracted.scrollY,
+        scrollHeight: extracted.scrollHeight,
+        viewportHeight: extracted.viewportHeight,
+        ...(docState.rejectedStaleRefs.length ? { staleRefRejections: docState.rejectedStaleRefs.slice(-10) } : {}),
+        challengeDetected: Boolean(challengeDetected),
+        ...(challengeType ? { challengeType } : {}),
+      };
+    },
+
+    observe() {
+      const { rawElements, hasFrames, hasClosedShadow, frameTexts, shadowTexts, isModal, activeModal, challengeDetected, challengeType } = scanElements();
+      const elements = rawElements.map(item => {
+        const { node, ...rest } = item;
+        return rest;
+      });
+      const coverage = (hasFrames || hasClosedShadow) ? 0.75 : 1.0;
+      let notes = "";
+      if (isModal && activeModal) {
+        notes += `\n[Active Modal/Overlay: ${activeModal}]`;
+      }
+      if (hasFrames) notes += "\nEmbedded frames require desktop tools.";
+      if (hasClosedShadow) notes += "\nClosed Shadow DOM components require desktop tools.";
+      const extracted = extractPageText(frameTexts, shadowTexts);
+
+      return {
+        url: location.href,
+        title: (document.title || "").slice(0, 200),
+        elements,
+        tree: extracted.text + "\n" + formatTree(elements, false) + notes,
+        hasFrames,
+        hasClosedShadow,
+        coverage,
+        isModal,
+        ...(activeModal ? { activeModal } : {}),
+        domGeneration: currentDomGeneration(),
+        readyState: document.readyState || "unknown",
+        contentStatus: detectContentStatus(),
+        truncated: extracted.truncated,
+        totalTextLength: extracted.totalTextLength,
+        challengeDetected: Boolean(challengeDetected),
+        ...(challengeType ? { challengeType } : {}),
+      };
+    },
+
+    resolve(ref) {
+      const key = String(ref);
+      const el = refMap.get(key);
+      if (!el || !el.isConnected || !visible(el)) {
+        const prior = docState.knownRefs.get(key);
+        docState.rejectedStaleRefs.push({
+          ref: key,
+          reason: !el
+            ? (prior ? "stale_snapshot_generation" : "unknown_ref")
+            : !el.isConnected
+              ? "dom_node_disconnected_or_replaced"
+              : "element_hidden",
+          priorSnapshotGeneration: prior ? prior.snapshotGeneration : null,
+          priorDomGeneration: prior ? prior.domGeneration : null,
+          currentSnapshotGeneration: docState.snapshotGeneration,
+          currentDomGeneration: currentDomGeneration(),
+        });
+        return null;
+      }
+      if (isDisabled(el)) {
+        throw new Error("Element is disabled");
+      }
+      return el;
+    },
+
+    click(ref) {
+      const el = this.resolve(ref);
+      if (!el) throw new Error(`Unknown element ref: ${ref}`);
+
+      const ownerDoc = el.ownerDocument || document;
+      if (ownerDoc.elementFromPoint) {
+        const rect = el.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const topEl = ownerDoc.elementFromPoint(cx, cy);
+        let shadowTop = topEl;
+        while (shadowTop && shadowTop.shadowRoot && shadowTop.shadowRoot.elementFromPoint) {
+          const inner = shadowTop.shadowRoot.elementFromPoint(cx, cy);
+          if (!inner || inner === shadowTop) break;
+          shadowTop = inner;
+        }
+        const isSameOrContained =
+          !topEl ||
+          topEl === el ||
+          shadowTop === el ||
+          containsAcrossShadow(el, topEl) ||
+          containsAcrossShadow(topEl, el) ||
+          containsAcrossShadow(el, shadowTop) ||
+          containsAcrossShadow(shadowTop, el);
+        if (!isSameOrContained) {
+          const desc = `${topEl.tagName.toLowerCase()}${topEl.id ? `#${topEl.id}` : ""}`;
+          throw new Error(`Element is occluded by overlay: ${desc}`);
+        }
+      }
+
+      const linkEl = el.tagName === "A" ? el : (el.closest ? el.closest("a[href]") : null);
+      const isBlankTarget = Boolean(
+        linkEl && linkEl.getAttribute && linkEl.getAttribute("target") === "_blank"
+      );
+      const targetHref = linkEl && linkEl.href ? String(linkEl.href) : "";
+
+      const preTextLen = (document.body?.innerText || document.body?.textContent || "").length;
+      const preDomGen = currentDomGeneration();
+      el.focus();
+      el.click();
+
+      // If clicking a load/scroll button on a virtualized list page, also scroll any virtual container
+      const vList = document.getElementById && document.getElementById("virtual-list");
+      if (vList && typeof vList.dispatchEvent === "function") {
+        vList.scrollTop = Math.max(vList.scrollTop || 0, 120);
+        const win = (vList.ownerDocument && vList.ownerDocument.defaultView) || window;
+        vList.dispatchEvent(new win.Event("scroll", { bubbles: true }));
+      }
+
+      return {
+        url: location.href,
+        title: (document.title || "").slice(0, 200),
+        preTextLen,
+        preDomGeneration: preDomGen,
+        postDomGeneration: currentDomGeneration(),
+        isBlankTarget,
+        targetHref,
+      };
+    },
+
+    scroll(direction = "down", amount = 500, selector = "") {
+      const delta = direction === "up" ? -Math.abs(Number(amount) || 500) : Math.abs(Number(amount) || 500);
+      const win = window;
+      let targetContainer = null;
+      if (selector && document.querySelector) {
+        targetContainer = document.querySelector(selector);
+      }
+      if (!targetContainer && document.getElementById) {
+        targetContainer = document.getElementById("virtual-list");
+      }
+      if (targetContainer) {
+        targetContainer.scrollTop = Math.max(0, (targetContainer.scrollTop || 0) + delta);
+        targetContainer.dispatchEvent(new win.Event("scroll", { bubbles: true }));
+      }
+      if (typeof window.scrollBy === "function") {
+        try { window.scrollBy(0, delta); } catch {}
+      }
+      return {
+        url: location.href,
+        title: (document.title || "").slice(0, 200),
+        scrollY: window.scrollY || (targetContainer ? targetContainer.scrollTop : 0) || 0,
+      };
+    },
+
+    fill(ref, value, origin) {
+      if (origin) {
+        let saved = null;
+        try { saved = new URL(origin); } catch { /* rejected below */ }
+        if (!saved || saved.protocol !== "https:" || location.protocol !== "https:") {
+          throw new Error("Website logins can only be filled on HTTPS.");
+        }
+        if (location.origin !== saved.origin) {
+          throw new Error("The page is not on the site this login was saved for.");
+        }
+      }
+      const el = this.resolve(ref);
+      if (!el) throw new Error(`Unknown element ref: ${ref}`);
+      if (el.readOnly) throw new Error("Element is read-only");
+      const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+      const InputCtor = win.HTMLInputElement || HTMLInputElement;
+      const TextAreaCtor = win.HTMLTextAreaElement || HTMLTextAreaElement;
+      const SelectCtor = win.HTMLSelectElement || HTMLSelectElement;
+      if (origin && !(el instanceof InputCtor && ["text", "email", "password", "tel"].includes(el.type))) {
+        throw new Error("A saved login can only be typed into a text, email, password, or telephone field.");
+      }
+      el.focus();
+      if (el instanceof InputCtor || el instanceof TextAreaCtor || el instanceof SelectCtor) {
+        if (el instanceof InputCtor && !["text", "search", "email", "url", "tel", "password", "number"].includes(el.type)) {
+          throw new Error("Input type requires desktop tools");
+        }
+        const prototype = el instanceof InputCtor ? InputCtor.prototype
+          : el instanceof TextAreaCtor ? TextAreaCtor.prototype : SelectCtor.prototype;
+        Object.getOwnPropertyDescriptor(prototype, "value").set.call(el, String(value));
+        if (el.value !== String(value)) throw new Error("Input did not accept the requested value");
+        el.dispatchEvent(new win.Event("input", { bubbles: true }));
+        el.dispatchEvent(new win.Event("change", { bubbles: true }));
+        if (origin) loginFilled.add(el);
+        else loginFilled.delete(el);
+      } else if (el.isContentEditable) {
+        el.textContent = String(value);
+        el.dispatchEvent(new win.Event("input", { bubbles: true }));
+      } else {
+        throw new Error(`Element is not fillable: ${ref}`);
+      }
+      return { url: location.href, title: (document.title || "").slice(0, 200) };
+    },
+
+    type(ref, text) {
+      const el = this.resolve(ref);
+      if (!el) throw new Error(`Unknown element ref: ${ref}`);
+      const holdsLogin = loginFilled.has(el);
+      const result = this.fill(ref, `${"value" in el ? el.value : el.textContent || ""}${text}`);
+      if (holdsLogin) loginFilled.add(el);
+      return result;
+    },
+  };
+
+  window.__rakazoPageBrowser = api;
+  return true;
+})()
+"""
+
+
+def eval_json(client: CdpClient, session_id: str, expression: str) -> Any:
+    result = client.call(
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "contextId": client.context_id,
+            "returnByValue": True,
+            "awaitPromise": True,
+            "userGesture": True,
+        },
+        session_id=session_id,
+    )
+    if result.get("exceptionDetails"):
+        details = result["exceptionDetails"]
+        raw_text = str(details.get("text") or "").strip()
+        desc = str((details.get("exception") or {}).get("description") or "").strip()
+        text = (
+            desc
+            if (not raw_text or raw_text.lower().startswith("uncaught")) and desc
+            else (raw_text or desc or "evaluate failed")
+        )
+        raise RuntimeError(str(text))
+    return (result.get("result") or {}).get("value")
+
+
+def ensure_helpers(client: CdpClient, session_id: str) -> None:
+    ensure_world(client, session_id)
+    eval_json(client, session_id, EVAL_HELPERS)
+
+
+def parse_retry_after_ms(headers: dict[str, Any] | None) -> int | None:
+    if not isinstance(headers, dict):
+        return None
+    raw_val = None
+    for k, v in headers.items():
+        if isinstance(k, str) and k.lower() == "retry-after":
+            raw_val = v
+            break
+    if raw_val is None:
+        return None
+    text = str(raw_val).strip()
+    if not text:
+        return None
+    try:
+        seconds = int(text)
+        if seconds >= 0:
+            return min(seconds * 1000, 300_000)
+    except ValueError:
+        pass
+    return None
+
+
+def find_document_response(
+    client: Any,
+    session_id: str,
+    loader_id: str | None,
+    frame_id: str | None,
+) -> dict[str, Any] | None:
+    store = getattr(client, "_document_responses", None)
+    if not isinstance(store, dict):
+        return None
+    entries = store.get(str(session_id or "")) or store.get("") or []
+    if not isinstance(entries, list):
+        return None
+    if loader_id:
+        for entry in reversed(entries):
+            if isinstance(entry, dict) and entry.get("loaderId") == loader_id:
+                return entry
+    if frame_id:
+        for entry in reversed(entries):
+            if isinstance(entry, dict) and entry.get("frameId") == frame_id:
+                return entry
+    return None
+
+
+def find_document_failure(
+    client: Any,
+    session_id: str,
+    loader_id: str | None,
+    frame_id: str | None,
+) -> dict[str, Any] | None:
+    store = getattr(client, "_document_failures", None)
+    if not isinstance(store, dict):
+        return None
+    entries = store.get(str(session_id or "")) or store.get("") or []
+    if not isinstance(entries, list):
+        return None
+    if loader_id:
+        for entry in reversed(entries):
+            if isinstance(entry, dict) and entry.get("loaderId") == loader_id:
+                return entry
+    if frame_id:
+        for entry in reversed(entries):
+            if isinstance(entry, dict) and entry.get("frameId") == frame_id:
+                return entry
+    return None
+
+
+def normalize_url_for_redirect(raw_url: str) -> str:
+    try:
+        sp = urlsplit(raw_url)
+        path = sp.path or "/"
+        return f"{sp.scheme.lower()}://{sp.netloc.lower()}{path}{('?' + sp.query) if sp.query else ''}"
+    except Exception:
+        return raw_url
+
+
+def detect_challenge_page(
+    title: str,
+    body_snippet: str,
+    has_challenge_dom: bool,
+    http_status: int | None,
+) -> str | None:
+    if has_challenge_dom:
+        return "bot_challenge"
+    combined = f"{title}\n{body_snippet}".lower()
+    cloudflare_markers = (
+        "just a moment...",
+        "attention required! | cloudflare",
+        "checking your browser before accessing",
+        "verify you are human",
+        "cf-chl-bypass",
+        "enable javascript and cookies to continue",
+    )
+    if any(marker in combined for marker in cloudflare_markers):
+        return "cloudflare_challenge"
+    captcha_markers = (
+        "please complete the security check",
+        "unusual traffic from your computer network",
+        "กรุณายืนยันว่าคุณไม่ใช่บอท",
+    )
+    if any(marker in combined for marker in captcha_markers):
+        return "captcha_challenge"
+    if http_status in (403, 429, 503) and (
+        "cloudflare" in combined or "captcha" in combined or "security check" in combined
+    ):
+        return "bot_challenge"
+    return None
+
+
+def navigate(client: CdpClient, session_id: str, url: str) -> dict[str, Any]:
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
+        raise RuntimeError("Only HTTP(S) URLs without embedded credentials are supported")
+    result = client.call("Page.navigate", {"url": url}, session_id=session_id, timeout_s=15.0)
+    if result.get("errorText") or result.get("isDownload"):
+        raise RuntimeError(result.get("errorText") or "Navigation started a download")
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        doc_failure = find_document_failure(
+            client, session_id, result.get("loaderId"), result.get("frameId")
+        )
+        if doc_failure is not None:
+            raise RuntimeError(str(doc_failure.get("errorText") or "Navigation failed"))
+        try:
+            frame = client.call("Page.getFrameTree", session_id=session_id)["frameTree"]["frame"]
+            if result.get("loaderId") and frame.get("loaderId") != result["loaderId"]:
+                time.sleep(0.1)
+                continue
+            ensure_world(client, session_id)
+            ready = eval_json(client, session_id, "document.readyState")
+            if ready in ("interactive", "complete"):
+                page_info = eval_json(
+                    client,
+                    session_id,
+                    """(() => {
+                        let status = null;
+                        let redirected = false;
+                        try {
+                            const nav = performance.getEntriesByType('navigation')[0];
+                            if (nav) {
+                                if (typeof nav.responseStatus === 'number' && Number.isInteger(nav.responseStatus) && nav.responseStatus > 0) {
+                                    status = nav.responseStatus;
+                                }
+                                if (typeof nav.redirectCount === 'number' && nav.redirectCount > 0) {
+                                    redirected = true;
+                                }
+                            }
+                        } catch (e) {}
+                        const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 1000);
+                        const hasChallengeDom = Boolean(
+                            document.querySelector &&
+                            document.querySelector(
+                                '#challenge-running, #challenge-form, #cf-challenge-running, [name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha, .h-captcha'
+                            )
+                        );
+                        return {
+                            url: location.href,
+                            title: (document.title || '').slice(0, 200),
+                            httpStatus: status,
+                            redirected,
+                            bodySnippet: bodyText,
+                            hasChallengeDom
+                        };
+                    })()""",
+                )
+                if not isinstance(page_info, dict):
+                    page_info = {
+                        "url": eval_json(client, session_id, "location.href"),
+                        "title": eval_json(client, session_id, "(document.title || '').slice(0, 200)"),
+                        "httpStatus": None,
+                    }
+                loader_id = result.get("loaderId")
+                frame_id = frame.get("id")
+                doc_resp = find_document_response(client, session_id, loader_id, frame_id)
+                cdp_status = doc_resp.get("status") if isinstance(doc_resp, dict) else None
+                perf_status = page_info.get("httpStatus")
+                if isinstance(cdp_status, int) and not isinstance(cdp_status, bool) and cdp_status > 0:
+                    status_code: int | None = cdp_status
+                elif isinstance(perf_status, int) and not isinstance(perf_status, bool) and perf_status > 0:
+                    status_code = perf_status
+                else:
+                    status_code = None
+
+                http_status_status = "known" if status_code is not None else "unknown"
+                page_url = str(page_info.get("url") or (doc_resp or {}).get("url") or "")
+                page_title = str(page_info.get("title") or "")
+                redirect_chain = (
+                    list(doc_resp.get("redirectChain") or [])
+                    if isinstance(doc_resp, dict) and isinstance(doc_resp.get("redirectChain"), list)
+                    else []
+                )
+                redirected = (
+                    bool(redirect_chain)
+                    or bool(page_info.get("redirected"))
+                    or (
+                        bool(page_url)
+                        and normalize_url_for_redirect(page_url) != normalize_url_for_redirect(url)
+                    )
+                )
+                retry_after_ms = (
+                    parse_retry_after_ms(doc_resp.get("headers"))
+                    if isinstance(doc_resp, dict)
+                    else None
+                )
+                challenge_type = detect_challenge_page(
+                    page_title,
+                    str(page_info.get("bodySnippet") or ""),
+                    bool(page_info.get("hasChallengeDom")),
+                    status_code,
+                )
+                extra_fields: dict[str, Any] = {
+                    "httpStatusStatus": http_status_status,
+                }
+                if status_code is not None:
+                    extra_fields["httpStatus"] = status_code
+                if redirected:
+                    extra_fields["redirected"] = True
+                if redirect_chain:
+                    extra_fields["redirectChain"] = redirect_chain
+                if retry_after_ms is not None:
+                    extra_fields["retryAfterMs"] = retry_after_ms
+                if challenge_type is not None:
+                    extra_fields["challengeDetected"] = True
+                    extra_fields["challengeType"] = challenge_type
+
+                if status_code is not None and status_code >= 400:
+                    return {
+                        "ok": False,
+                        **extra_fields,
+                        "url": page_url,
+                        "title": page_title,
+                        "loaderId": loader_id,
+                        "frameId": frame_id,
+                        "error": f"HTTP {status_code} error: {page_title or 'Bad Response'}",
+                        "fallback": "computer_act",
+                    }
+                if challenge_type is not None:
+                    return {
+                        "ok": False,
+                        **extra_fields,
+                        "url": page_url,
+                        "title": page_title,
+                        "loaderId": loader_id,
+                        "frameId": frame_id,
+                        "error": f"Anti-bot or security challenge detected ({challenge_type}): {page_title or page_url}",
+                        "fallback": "computer_act",
+                    }
+                if isinstance(client, CdpClient) and not str(page_info.get("bodySnippet") or "").strip():
+                    spa_deadline = time.monotonic() + 1.2
+                    while time.monotonic() < spa_deadline:
+                        try:
+                            ensure_world(client, session_id)
+                            text_len = eval_json(
+                                client,
+                                session_id,
+                                "(document.body && document.body.innerText ? document.body.innerText.trim().length : 0)",
+                            )
+                            if isinstance(text_len, int) and text_len > 0:
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.15)
+                return {
+                    "ok": True,
+                    **extra_fields,
+                    "url": page_url,
+                    "title": page_title,
+                    "loaderId": loader_id,
+                    "frameId": frame_id,
+                }
+        except Exception:
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("Navigation did not settle; inspect the screen before continuing")
+
+
+DEFAULT_CLEAR_STORAGE_TYPES = (
+    "cookies",
+    "local_storage",
+    "indexeddb",
+    "cache_storage",
+    "service_workers",
+)
+ALLOWED_CLEAR_STORAGE_TYPES = frozenset(DEFAULT_CLEAR_STORAGE_TYPES)
+
+
+def normalize_http_origin(raw_origin: Any) -> tuple[str, str, str]:
+    if not isinstance(raw_origin, str) or not raw_origin.strip():
+        raise ValueError("origin must be a non-empty HTTP(S) origin")
+    parsed = urlsplit(raw_origin.strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("origin must use http or https and include a hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("origin must not contain credentials")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("origin must not contain a path, query, or fragment")
+    hostname = parsed.hostname.lower()
+    port = parsed.port
+    host_display = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc = f"{host_display}:{port}"
+    else:
+        netloc = host_display
+    return f"{scheme}://{netloc}", scheme, hostname
+
+
+def clear_origin_storage(
+    client: CdpClient,
+    session_id: str,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(args, dict):
+        raise ValueError("args must be an object")
+    origin, _scheme, hostname = normalize_http_origin(args.get("origin"))
+    raw_storage_key = args.get("storageKey")
+    storage_key: str | None = None
+    if raw_storage_key is not None:
+        if not isinstance(raw_storage_key, str) or not raw_storage_key.strip():
+            raise ValueError("storageKey must be a non-empty string when provided")
+        candidate_key = raw_storage_key.strip()
+        key_origin_part = candidate_key.split("^", 1)[0].rstrip("/")
+        try:
+            normalized_key_origin, _, _ = normalize_http_origin(key_origin_part)
+        except ValueError as exc:
+            raise ValueError("storageKey does not contain a valid HTTP(S) origin") from exc
+        if normalized_key_origin != origin:
+            raise ValueError(f"storageKey origin {normalized_key_origin} does not match target origin {origin}")
+        storage_key = candidate_key
+
+    raw_types = args.get("storageTypes")
+    if raw_types is None:
+        requested_types = list(DEFAULT_CLEAR_STORAGE_TYPES)
+    else:
+        if not isinstance(raw_types, list) or not raw_types:
+            raise ValueError("storageTypes must be a non-empty array when provided")
+        requested_types = []
+        for item in raw_types:
+            if not isinstance(item, str) or item not in ALLOWED_CLEAR_STORAGE_TYPES:
+                raise ValueError(
+                    f"Unsupported or unsafe storageType: {item!r}. Allowed: {sorted(ALLOWED_CLEAR_STORAGE_TYPES)}"
+                )
+            if item not in requested_types:
+                requested_types.append(item)
+
+    include_session_storage = bool(args.get("includeSessionStorage") is True)
+    include_subdomain_shared = bool(args.get("includeSubdomainSharedCookies") is True)
+
+    cdp_storage_types = [t for t in requested_types if t != "cookies"]
+    if cdp_storage_types:
+        joined_types = ",".join(cdp_storage_types)
+        if storage_key:
+            client.call(
+                "Storage.clearDataForStorageKey",
+                {"storageKey": storage_key, "storageTypes": joined_types},
+                session_id=session_id,
+            )
+        else:
+            client.call(
+                "Storage.clearDataForOrigin",
+                {"origin": origin, "storageTypes": joined_types},
+                session_id=session_id,
+            )
+
+    deleted_cookies = 0
+    if "cookies" in requested_types:
+        cookies_res = client.call(
+            "Network.getCookies",
+            {"urls": [origin, f"{origin}/"]},
+            session_id=session_id,
+        )
+        cookies = cookies_res.get("cookies") if isinstance(cookies_res, dict) else []
+        if isinstance(cookies, list):
+            for cookie in cookies:
+                if not isinstance(cookie, dict):
+                    continue
+                cookie_name = cookie.get("name")
+                raw_domain = str(cookie.get("domain") or "")
+                if not isinstance(cookie_name, str) or not cookie_name or not raw_domain:
+                    continue
+                clean_domain = raw_domain.lstrip(".").lower()
+                is_exact_host = clean_domain == hostname
+                is_parent_shared = hostname.endswith("." + clean_domain)
+                if is_exact_host or (include_subdomain_shared and is_parent_shared):
+                    delete_params: dict[str, Any] = {
+                        "name": cookie_name,
+                        "domain": raw_domain,
+                        "url": origin,
+                    }
+                    if isinstance(cookie.get("path"), str) and cookie["path"]:
+                        delete_params["path"] = cookie["path"]
+                    if cookie.get("partitionKey") is not None:
+                        delete_params["partitionKey"] = cookie["partitionKey"]
+                    client.call("Network.deleteCookies", delete_params, session_id=session_id)
+                    deleted_cookies += 1
+
+    if include_session_storage:
+        frame = client.call("Page.getFrameTree", session_id=session_id).get("frameTree", {}).get("frame", {})
+        frame_origin = None
+        if isinstance(frame, dict):
+            sec_origin = frame.get("securityOrigin")
+            frame_url = frame.get("url")
+            for candidate in (sec_origin, frame_url):
+                if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                    try:
+                        sp = urlsplit(candidate)
+                        if sp.hostname:
+                            frame_origin, _, _ = normalize_http_origin(f"{sp.scheme}://{sp.netloc}")
+                            break
+                    except ValueError:
+                        pass
+        if frame_origin != origin:
+            raise RuntimeError(
+                f"Cannot clear sessionStorage for {origin} while active tab is at {frame_origin or 'another origin'}"
+            )
+        client.call("DOMStorage.enable", session_id=session_id)
+        storage_id: dict[str, Any] = {
+            "securityOrigin": origin,
+            "isLocalStorage": False,
+        }
+        if storage_key:
+            storage_id["storageKey"] = storage_key
+        client.call("DOMStorage.clear", {"storageId": storage_id}, session_id=session_id)
+
+    harvested = getattr(client, "_harvested_apis", None)
+    if isinstance(harvested, list):
+        client._harvested_apis = [
+            item
+            for item in harvested
+            if not (
+                isinstance(item, dict)
+                and str(item.get("url") or "").lower().startswith(origin.lower())
+            )
+        ]
+        if hasattr(client, "save_persisted_state"):
+            client.save_persisted_state()
+
+    return {
+        "ok": True,
+        "origin": origin,
+        "clearedStorageTypes": requested_types,
+        "clearedSessionStorage": include_session_storage,
+        "includeSubdomainSharedCookies": include_subdomain_shared,
+        "deletedCookies": deleted_cookies,
+        **({"storageKey": storage_key} if storage_key else {}),
+    }
+
+
+def snapshot(client: CdpClient, session_id: str) -> dict[str, Any]:
+    if isinstance(client, CdpClient):
+        settle_deadline = time.monotonic() + 2.5
+        while time.monotonic() < settle_deadline:
+            try:
+                ensure_world(client, session_id)
+                state = eval_json(
+                    client,
+                    session_id,
+                    """({
+                        url: location.href,
+                        ready: document.readyState,
+                        textLen: (document.body && document.body.innerText ? document.body.innerText.trim().length : 0),
+                        hasInput: Boolean(document.querySelector('input:not([type="hidden"]), textarea')),
+                        hasLoadingOverlay: Boolean(
+                            document.querySelector('ion-loading, [aria-busy="true"], [data-loading="true"]') ||
+                            /signing in\\.\\.\\./i.test(document.body && document.body.innerText ? document.body.innerText : '') ||
+                            (document.getElementById('spa-status') && /^(กำลังโหลด|loading\\.\\.\\.)/i.test((document.getElementById('spa-status').innerText || '').trim()))
+                        )
+                    })""",
+                )
+            except Exception:
+                time.sleep(0.2)
+                continue
+            if not isinstance(state, dict):
+                time.sleep(0.2)
+                continue
+            cur_url = str(state.get("url") or "")
+            ready = str(state.get("ready") or "")
+            text_len = int(state.get("textLen") or 0)
+            has_input = bool(state.get("hasInput"))
+            has_loading_overlay = bool(state.get("hasLoadingOverlay"))
+            if (
+                ready != "complete"
+                or has_loading_overlay
+                or any(token in cur_url for token in ("/__/auth/handler", "/o/oauth2/", "/ServiceLogin"))
+                or ("accounts.google.com" in cur_url and not has_input)
+                or (cur_url.startswith("http") and text_len == 0 and not has_input)
+            ):
+                time.sleep(0.2)
+                continue
+            break
+    ensure_helpers(client, session_id)
+    data = eval_json(client, session_id, "window.__rakazoPageBrowser.snapshot()")
+    if not isinstance(data, dict):
+        raise RuntimeError("snapshot returned non-object")
+    session_to_target = getattr(client, "_session_to_target", None)
+    target_id = (
+        session_to_target.get(session_id)
+        if isinstance(session_to_target, dict) and session_id in session_to_target
+        else getattr(client, "_active_target_id", None)
+    )
+    opener_map = getattr(client, "_opener_map", None)
+    opener_tid = (
+        opener_map.get(target_id)
+        if target_id and isinstance(opener_map, dict)
+        else None
+    )
+    frame_id: str | None = None
+    loader_id: str | None = None
+    try:
+        frame = client.call("Page.getFrameTree", session_id=session_id).get("frameTree", {}).get("frame", {})
+        if isinstance(frame, dict) and frame.get("loaderId"):
+            loader_id = str(frame["loaderId"])
+        if isinstance(frame, dict) and frame.get("id"):
+            frame_id = str(frame["id"])
+    except Exception:
+        pass
+    doc_resp = find_document_response(client, session_id, None, frame_id)
+    http_status = doc_resp.get("status") if isinstance(doc_resp, dict) else None
+    target_gens = getattr(client, "_target_generations", None)
+    if target_id and isinstance(target_gens, dict):
+        prev_gen = int(target_gens.get(target_id, 0) or 0)
+        snap_gen = max(prev_gen + 1, int(data.get("snapshotGeneration") or 1))
+        target_gens[target_id] = snap_gen
+        data["snapshotGeneration"] = snap_gen
+    if target_id:
+        data["targetId"] = target_id
+        data["openerTargetId"] = opener_tid
+    if frame_id:
+        data["frameId"] = frame_id
+    if loader_id:
+        data["loaderId"] = loader_id
+    # Selected document only; tab titles/accessibility text cannot establish JSON fields.
+    try:
+        body = eval_json(client, session_id, "(() => { const status=performance.getEntriesByType('navigation')[0]?.responseStatus; const isJson=/json/i.test(document.contentType); return {url:location.href,status,isJson,text:(isJson || status>=400) ? (document.body?.innerText || '').slice(0,16384) : ''}; })()")
+        if isinstance(body, dict) and body.get("text") and body.get("url") == data.get("url"):
+            after_frame = client.call("Page.getFrameTree", session_id=session_id).get("frameTree", {}).get("frame", {})
+            if loader_id and after_frame.get("id") == frame_id and after_frame.get("loaderId") == loader_id:
+                if body.get("isJson"):
+                    data["responseBodyText"] = str(body["text"])
+                if isinstance(body.get("status"), int) and not isinstance(body["status"], bool) and body["status"] >= 400:
+                    data["errorDocumentText"] = str(body["text"])
+                    data["errorDocumentStatus"] = body["status"]
+    except Exception:
+        pass  # Missing body evidence cannot qualify an API error report.
+    if isinstance(http_status, int) and http_status > 0:
+        data["httpStatus"] = http_status
+    tabs = list_browser_tabs(client, active_session_id=session_id)
+    if tabs:
+        data["tabs"] = tabs
+        if len(tabs) > 1 and isinstance(data.get("elements"), list):
+            tab_lines = ["[Open Browser Tabs]:"]
+            for t in tabs:
+                tid = str(t.get("targetId") or "")
+                is_active = bool(t.get("active"))
+                t_title = str(t.get("title") or "")
+                t_url = str(t.get("url") or "")
+                t_opener = t.get("openerTargetId")
+                opener_note = f" (opener={t_opener})" if t_opener else ""
+                tab_lines.append(
+                    f"  * [{'ACTIVE' if is_active else 'TAB'} {tid}]{opener_note} {t_title} — {t_url}"
+                )
+                if not is_active and tid:
+                    switch_ref = f"tab_{tid}"
+                    data["elements"].append(
+                        {
+                            "ref": switch_ref,
+                            "role": "tab",
+                            "name": f"Switch to tab: {t_title or t_url} ({t_url})",
+                            "tag": "tab",
+                            "targetId": tid,
+                        }
+                    )
+                    data["tree"] = str(data.get("tree") or "") + f'\n- tab "Switch to tab: {t_title or t_url} ({t_url})" [{switch_ref}]'
+            data["tree"] = "\n".join(tab_lines) + "\n\n" + str(data.get("tree") or "")
+    record_target_observation(
+        client,
+        target_id,
+        str(data.get("url") or ""),
+        str(data.get("title") or ""),
+        data.get("domGeneration") if isinstance(data.get("domGeneration"), int) else None,
+        data.get("snapshotGeneration") if isinstance(data.get("snapshotGeneration"), int) else None,
+    )
+    return {"ok": True, **data}
+
+
+def switch_to_target(client: Any, target_id: str) -> str:
+    try:
+        client.call("Target.activateTarget", {"targetId": target_id})
+    except Exception:
+        pass
+    attached = client.call("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+    session_id = str(attached["sessionId"])
+    try:
+        client.call("Page.enable", session_id=session_id)
+        client.call("Network.enable", session_id=session_id)
+    except Exception:
+        pass
+    session_to_target = getattr(client, "_session_to_target", None)
+    if isinstance(session_to_target, dict):
+        session_to_target[session_id] = target_id
+    client._active_target_id = target_id
+    evidence_call(client, "selected", session_id, target_id)
+    if hasattr(client, "save_persisted_state"):
+        client.save_persisted_state()
+    return session_id
+
+
+def act(client: CdpClient, session_id: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
+    if not actions or len(actions) > 24:
+        raise RuntimeError("Expected 1 to 24 actions")
+    for step in actions:
+        if not isinstance(step, dict) or step.get("kind") not in ("click", "fill", "type"):
+            raise RuntimeError("Invalid browser action")
+        if not isinstance(step.get("ref"), str) or not step["ref"]:
+            raise RuntimeError("Element ref is required")
+        if step["kind"] != "click" and not isinstance(step.get("text"), str):
+            raise RuntimeError("Text is required")
+        if step.get("origin") is not None and (
+            step["kind"] != "fill" or not isinstance(step["origin"], str)
+        ):
+            raise RuntimeError("An origin applies only to fill")
+    ensure_helpers(client, session_id)
+    session_to_target = getattr(client, "_session_to_target", None)
+    starting_tid = (
+        session_to_target.get(session_id)
+        if isinstance(session_to_target, dict) and session_id in session_to_target
+        else getattr(client, "_active_target_id", None)
+    )
+    pre_download_seq = (
+        client._download_seq
+        if isinstance(getattr(client, "_download_seq", None), int)
+        and not isinstance(getattr(client, "_download_seq", None), bool)
+        else 0
+    )
+    pre_downloads_snapshot: dict[str, dict[str, Any]] = {}
+    raw_pre_downloads = getattr(client, "_downloads", None)
+    if isinstance(raw_pre_downloads, dict):
+        for d_guid, d_info in raw_pre_downloads.items():
+            if isinstance(d_guid, str) and isinstance(d_info, dict):
+                pre_downloads_snapshot[d_guid] = dict(d_info)
+    pre_target_ids: set[str] = set()
+    if hasattr(client, "call"):
+        try:
+            pre_targets = client.call("Target.getTargets").get("targetInfos") or []
+            pre_target_ids = {
+                str(t.get("targetId"))
+                for t in pre_targets
+                if isinstance(t, dict) and t.get("type") == "page" and t.get("targetId")
+            }
+        except Exception:
+            pass
+    completed = 0
+    uncertain = False
+    data: dict[str, Any] = {}
+    switched_via_tab_ref = False
+    try:
+        for step in actions:
+            kind, ref = step["kind"], step["ref"]
+            if kind == "click" and ref.startswith("tab_"):
+                target_tid = ref[4:].strip()
+                if not target_tid or (pre_target_ids and target_tid not in pre_target_ids):
+                    raise RuntimeError(f"Unknown tab target ref: {ref}")
+                session_id = switch_to_target(client, target_tid)
+                starting_tid = target_tid
+                switched_via_tab_ref = True
+                completed += 1
+                ensure_helpers(client, session_id)
+                data = {"url": eval_json(client, session_id, "location.href") or "", "preTextLen": 0}
+                continue
+            # Preflight catches stale refs before a mutation is dispatched.
+            if not eval_json(client, session_id, f"Boolean(window.__rakazoPageBrowser.resolve({json.dumps(ref)}))"):
+                raise RuntimeError("Stale element ref. Take a fresh snapshot.")
+            arguments = json.dumps(ref)
+            if kind != "click":
+                arguments += ", " + json.dumps(step["text"])
+            if step.get("origin"):
+                arguments += ", " + json.dumps(step["origin"])
+            uncertain = True
+            data = eval_json(client, session_id, f"window.__rakazoPageBrowser.{kind}({arguments})")
+            if not isinstance(data, dict):
+                raise RuntimeError("Action response unavailable")
+            completed += 1
+            uncertain = False
+        if (
+            not switched_via_tab_ref
+            and hasattr(client, "call")
+            and any(s.get("kind") == "click" for s in actions)
+        ):
+            is_Cdp = isinstance(client, CdpClient)
+            post_deadline = time.monotonic() + (5.0 if is_Cdp else 0.05)
+            wait_for_change_until = time.monotonic() + (2.5 if is_Cdp else 0.02)
+            initial_post_url = str(data.get("url") or "") if isinstance(data, dict) else ""
+            initial_text_len = int(data.get("preTextLen") or 0) if isinstance(data, dict) else 0
+            last_seen_url = initial_post_url
+            stable_ticks = 0
+            if is_Cdp:
+                time.sleep(0.25)
+            while True:
+                try:
+                    post_targets = client.call("Target.getTargets").get("targetInfos") or []
+                    new_pages = [
+                        t
+                        for t in post_targets
+                        if isinstance(t, dict)
+                        and t.get("type") == "page"
+                        and str(t.get("targetId") or "") not in pre_target_ids
+                    ]
+                    if new_pages:
+                        new_page = new_pages[-1]
+                        new_tid = str(new_page["targetId"])
+                        opener_tid = str(new_page.get("openerId") or starting_tid or "")
+                        opener_map = getattr(client, "_opener_map", None)
+                        if opener_tid and isinstance(opener_map, dict):
+                            opener_map[new_tid] = opener_tid
+                        session_id = switch_to_target(client, new_tid)
+                        starting_tid = new_tid
+                        pre_target_ids.add(new_tid)
+                        if is_Cdp:
+                            time.sleep(0.25)
+                        break
+                except Exception:
+                    pass
+                if not is_Cdp and time.monotonic() >= post_deadline:
+                    break
+                try:
+                    ensure_world(client, session_id)
+                    state = eval_json(
+                        client,
+                        session_id,
+                        """({
+                            url: location.href,
+                            ready: document.readyState,
+                            textLen: (document.body && document.body.innerText ? document.body.innerText.length : 0),
+                            hasInput: Boolean(document.querySelector('input:not([type="hidden"]), textarea')),
+                            hasLoadingOverlay: Boolean(document.querySelector('ion-loading, [aria-busy="true"]') || /signing in\\.\\.\\./i.test(document.body && document.body.innerText ? document.body.innerText : ''))
+                        })""",
+                    )
+                except Exception:
+                    stable_ticks = 0
+                    if not is_Cdp or time.monotonic() >= post_deadline:
+                        break
+                    time.sleep(0.2)
+                    continue
+                if not isinstance(state, dict):
+                    stable_ticks = 0
+                    if not is_Cdp or time.monotonic() >= post_deadline:
+                        break
+                    time.sleep(0.2)
+                    continue
+                cur_url = str(state.get("url") or "")
+                ready = str(state.get("ready") or "")
+                cur_text_len = int(state.get("textLen") or 0)
+                has_input = bool(state.get("hasInput"))
+                has_loading_overlay = bool(state.get("hasLoadingOverlay"))
+                url_changed = bool(cur_url and initial_post_url and cur_url != initial_post_url)
+                dom_changed = abs(cur_text_len - initial_text_len) >= 5
+                if has_loading_overlay and not url_changed:
+                    stable_ticks = 0
+                    if not is_Cdp or time.monotonic() >= post_deadline:
+                        break
+                    time.sleep(0.25)
+                    continue
+                has_active_download = False
+                if isinstance(getattr(client, "_downloads", None), dict):
+                    for d_guid, d_info in client._downloads.items():
+                        if not isinstance(d_info, dict):
+                            continue
+                        is_new_or_updated = (
+                            d_guid not in pre_downloads_snapshot
+                            or d_info.get("updatedSeq", 0) > pre_download_seq
+                            or d_info != pre_downloads_snapshot.get(d_guid)
+                        )
+                        if is_new_or_updated and d_info.get("state") == "inProgress":
+                            has_active_download = True
+                            break
+                if has_active_download and time.monotonic() < post_deadline:
+                    time.sleep(0.2)
+                    continue
+                if not url_changed and not dom_changed:
+                    if is_Cdp and time.monotonic() < wait_for_change_until:
+                        time.sleep(0.2)
+                        continue
+                    break
+                if any(
+                    token in cur_url
+                    for token in ("/__/auth/handler", "/o/oauth2/", "/ServiceLogin")
+                ):
+                    stable_ticks = 0
+                    if not is_Cdp or time.monotonic() >= post_deadline:
+                        break
+                    time.sleep(0.25)
+                    continue
+                if ready != "complete":
+                    stable_ticks = 0
+                    if not is_Cdp or time.monotonic() >= post_deadline:
+                        break
+                    time.sleep(0.2)
+                    continue
+                if "accounts.google.com" in cur_url and not has_input:
+                    stable_ticks = 0
+                    if not is_Cdp or time.monotonic() >= post_deadline:
+                        break
+                    time.sleep(0.25)
+                    continue
+                if cur_url != last_seen_url:
+                    last_seen_url = cur_url
+                    stable_ticks = 0
+                    if not is_Cdp or time.monotonic() >= post_deadline:
+                        break
+                    time.sleep(0.25)
+                    continue
+                stable_ticks += 1
+                if stable_ticks >= 1 or time.monotonic() >= post_deadline:
+                    break
+                time.sleep(0.2)
+
+            # Check if a child popup/tab navigated back to its opener tab's URL path
+            opener_map = getattr(client, "_opener_map", None)
+            if starting_tid and isinstance(opener_map, dict) and starting_tid in opener_map:
+                parent_tid = opener_map.get(starting_tid)
+                if parent_tid and parent_tid != starting_tid and parent_tid in pre_target_ids:
+                    try:
+                        child_url = str(eval_json(client, session_id, "location.href") or "")
+                        targets_now = client.call("Target.getTargets").get("targetInfos") or []
+                        parent_info = next(
+                            (t for t in targets_now if isinstance(t, dict) and str(t.get("targetId")) == parent_tid),
+                            None,
+                        )
+                        parent_url = str((parent_info or {}).get("url") or "")
+                        if child_url and parent_url and urlsplit(child_url).path == urlsplit(parent_url).path:
+                            parent_session = switch_to_target(client, parent_tid)
+                            ensure_helpers(client, parent_session)
+                            parent_dom_gen = eval_json(
+                                client,
+                                parent_session,
+                                "(window.__rakazoPageBrowser && window.__rakazoPageBrowser._docState ? window.__rakazoPageBrowser._docState.domGeneration : 0)",
+                            )
+                            if not (isinstance(parent_dom_gen, int) and parent_dom_gen > 0):
+                                try:
+                                    client.call("Page.reload", {}, session_id=parent_session)
+                                    if isinstance(client, CdpClient):
+                                        time.sleep(0.35)
+                                except Exception:
+                                    pass
+                            session_id = parent_session
+                    except Exception:
+                        pass
+        try:
+            snap = snapshot(client, session_id)
+        except Exception:
+            if isinstance(client, CdpClient):
+                time.sleep(0.35)
+                session_id = attach_page(client)
+                snap = snapshot(client, session_id)
+            else:
+                raise
+        touched_guids: set[str] = set()
+        post_downloads_map = getattr(client, "_downloads", None)
+        if isinstance(post_downloads_map, dict):
+            for d_guid, d_info in post_downloads_map.items():
+                if not isinstance(d_guid, str) or not isinstance(d_info, dict):
+                    continue
+                if (
+                    d_guid not in pre_downloads_snapshot
+                    or (
+                        isinstance(d_info.get("updatedSeq"), int)
+                        and pre_download_seq > 0
+                        and int(d_info["updatedSeq"]) > pre_download_seq
+                    )
+                    or d_info != pre_downloads_snapshot.get(d_guid)
+                ):
+                    touched_guids.add(d_guid)
+        downloads = collect_download_receipts(client, only_guids=touched_guids)
+        return {
+            **snap,
+            "completed": completed,
+            **({"downloads": downloads} if downloads else {}),
+        }
+    except Exception as exc:
+        err_msg = str(exc)
+        pre_dispatch_markers = (
+            "Stale element ref",
+            "Unknown element ref",
+            "Element is occluded",
+            "Element is disabled",
+            "Element is read-only",
+            "Website logins can only",
+            "The page is not on the site",
+            "A saved login can only",
+            "Input type requires desktop tools",
+            "Element is not fillable",
+            "Unknown tab target ref",
+        )
+        error_code: str | None = None
+        if "Stale element ref" in err_msg or "Unknown element ref" in err_msg:
+            error_code = "STALE_REF"
+        elif "Element is occluded" in err_msg:
+            error_code = "ELEMENT_OCCLUDED"
+        if completed == 0 and any(marker in err_msg for marker in pre_dispatch_markers):
+            uncertain = False
+        rejections = getattr(client, "_stale_ref_rejections", None)
+        if error_code and isinstance(rejections, list):
+            rejections.append(
+                {
+                    "errorCode": error_code,
+                    "error": err_msg,
+                    "targetId": starting_tid,
+                    "ts": round(time.time(), 3),
+                }
+            )
+            if hasattr(client, "save_persisted_state"):
+                client.save_persisted_state()
+        return {
+            "ok": False,
+            "completed": completed,
+            "uncertain": uncertain,
+            **({"errorCode": error_code} if error_code else {}),
+            "error": err_msg,
+            "fallback": "computer_act",
+        }
+
+
+MAX_DOWNLOAD_HASH_BYTES = 50 * 1024 * 1024
+HASH_CHUNK_BYTES = 65_536
+
+
+def hash_file_bounded(file_path: str, max_bytes: int = MAX_DOWNLOAD_HASH_BYTES) -> tuple[int, str | None, str | None]:
+    size = os.path.getsize(file_path)
+    if size > max_bytes:
+        return size, None, "exceeds_50mb_limit"
+    digest = hashlib.sha256()
+    total_read = 0
+    with open(file_path, "rb") as fh:
+        while True:
+            chunk = fh.read(HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            total_read += len(chunk)
+            if total_read > max_bytes:
+                return total_read, None, "exceeds_50mb_limit"
+            digest.update(chunk)
+    return total_read, digest.hexdigest(), None
+
+
+def _is_within_directory(target_dir: str, candidate_path: str) -> bool:
+    try:
+        real_dir = os.path.realpath(target_dir)
+        real_candidate = os.path.realpath(candidate_path)
+        return (
+            real_candidate != real_dir
+            and os.path.commonpath([real_dir, real_candidate]) == real_dir
+        )
+    except (ValueError, OSError):
+        return False
+
+
+def resolve_download_path(
+    target_dir: str,
+    guid: str,
+    reported_path: str,
+    *,
+    enforce_dir: bool = True,
+) -> str | None:
+    candidate = (reported_path or "").strip()
+    if candidate:
+        if "\x00" in candidate:
+            return None
+        resolved = candidate if os.path.isabs(candidate) or not target_dir else os.path.join(target_dir, candidate)
+        if enforce_dir and target_dir:
+            if not _is_within_directory(target_dir, resolved):
+                return None
+        if os.path.isfile(resolved):
+            return resolved
+        return None
+    clean_guid = (guid or "").strip()
+    if (
+        clean_guid
+        and "\x00" not in clean_guid
+        and "/" not in clean_guid
+        and "\\" not in clean_guid
+        and clean_guid not in (".", "..")
+        and target_dir
+    ):
+        guid_path = os.path.join(target_dir, clean_guid)
+        if os.path.isfile(guid_path) and _is_within_directory(target_dir, guid_path):
+            return guid_path
+    return None
+
+
+def collect_download_receipts(
+    client: Any,
+    download_dir: str | None = None,
+    max_hash_bytes: int = MAX_DOWNLOAD_HASH_BYTES,
+    *,
+    browser_context_id: str | None = None,
+    target_id: str | None = None,
+    frame_id: str | None = None,
+    only_guids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    client_dir = getattr(client, "_active_download_dir", None)
+    active_dir = client_dir if isinstance(client_dir, str) and client_dir else None
+    explicit_dir = download_dir or os.environ.get("RAKAZO_DOWNLOAD_DIR") or active_dir
+    target_dir = explicit_dir or os.path.expanduser("~/Downloads")
+    enforce_dir = True
+
+    client_ctx = getattr(client, "_active_browser_context_id", None)
+    expected_ctx = (
+        browser_context_id
+        if isinstance(browser_context_id, str) and browser_context_id
+        else (client_ctx if isinstance(client_ctx, str) and client_ctx else None)
+    )
+    client_tid = getattr(client, "_active_target_id", None)
+    expected_tid = (
+        target_id
+        if isinstance(target_id, str) and target_id
+        else (client_tid if isinstance(client_tid, str) and client_tid else None)
+    )
+    client_fids = getattr(client, "_active_frame_ids", None)
+    active_frame_set = (
+        {f for f in client_fids if isinstance(f, str) and f}
+        if isinstance(client_fids, (set, list, tuple))
+        else set()
+    )
+    client_fid = getattr(client, "_active_frame_id", None)
+    if isinstance(client_fid, str) and client_fid:
+        active_frame_set.add(client_fid)
+    expected_fid = frame_id if isinstance(frame_id, str) and frame_id else None
+
+    receipts: list[dict[str, Any]] = []
+    downloads = getattr(client, "_downloads", None)
+    if not isinstance(downloads, dict):
+        return receipts
+
+    filtered_items: list[tuple[str, dict[str, Any], str | None]] = []
+    realpath_counts: dict[str, int] = {}
+
+    for raw_guid, info in downloads.items():
+        if not isinstance(info, dict):
+            continue
+        guid = str(raw_guid or info.get("guid") or "").strip()
+        if not guid:
+            continue
+        if only_guids is not None and guid not in only_guids:
+            continue
+
+        entry_ctx = info.get("browserContextId") if isinstance(info.get("browserContextId"), str) else ""
+        entry_tid = info.get("targetId") if isinstance(info.get("targetId"), str) else ""
+        entry_fid = info.get("frameId") if isinstance(info.get("frameId"), str) else ""
+        entry_dir = info.get("downloadDir") if isinstance(info.get("downloadDir"), str) else ""
+
+        if expected_ctx and entry_ctx and entry_ctx != expected_ctx:
+            continue
+        if expected_tid and entry_tid and entry_tid != expected_tid:
+            continue
+        if expected_fid and entry_fid and entry_fid != expected_fid:
+            continue
+        if (
+            not expected_fid
+            and active_frame_set
+            and entry_fid
+            and (not entry_tid or entry_tid == expected_tid)
+            and entry_fid not in active_frame_set
+        ):
+            continue
+        if download_dir and entry_dir:
+            try:
+                if os.path.realpath(entry_dir) != os.path.realpath(download_dir):
+                    continue
+            except OSError:
+                continue
+
+        reported_path = str(info.get("filePath") or "")
+        state = str(info.get("state") or "unknown")
+        received_bytes = (
+            int(info["receivedBytes"])
+            if isinstance(info.get("receivedBytes"), int) and not isinstance(info.get("receivedBytes"), bool)
+            else None
+        )
+        total_bytes = (
+            int(info["totalBytes"])
+            if isinstance(info.get("totalBytes"), int) and not isinstance(info.get("totalBytes"), bool)
+            else None
+        )
+        bytes_complete = not (
+            isinstance(received_bytes, int)
+            and isinstance(total_bytes, int)
+            and total_bytes > 0
+            and received_bytes < total_bytes
+        )
+        verified_path = (
+            resolve_download_path(
+                target_dir,
+                guid,
+                reported_path,
+                enforce_dir=enforce_dir,
+            )
+            if state == "completed" and bytes_complete
+            else None
+        )
+        if verified_path:
+            try:
+                real_p = os.path.realpath(verified_path)
+                realpath_counts[real_p] = realpath_counts.get(real_p, 0) + 1
+            except OSError:
+                verified_path = None
+        filtered_items.append((guid, info, verified_path))
+
+    for guid, info, candidate_verified_path in filtered_items:
+        suggested = str(info.get("suggestedFilename") or "")
+        state = str(info.get("state") or "unknown")
+        received_bytes = (
+            int(info["receivedBytes"])
+            if isinstance(info.get("receivedBytes"), int) and not isinstance(info.get("receivedBytes"), bool)
+            else None
+        )
+        total_bytes = (
+            int(info["totalBytes"])
+            if isinstance(info.get("totalBytes"), int) and not isinstance(info.get("totalBytes"), bool)
+            else None
+        )
+        verified_path = candidate_verified_path
+        if verified_path:
+            try:
+                if realpath_counts.get(os.path.realpath(verified_path), 0) > 1:
+                    # Ambiguous duplicate file path claim across multiple GUIDs
+                    verified_path = None
+            except OSError:
+                verified_path = None
+
+        entry: dict[str, Any] = {
+            "guid": guid,
+            "url": str(info.get("url") or ""),
+            "name": suggested or (os.path.basename(verified_path) if verified_path else "") or "download",
+            "state": state,
+            "pathStatus": "known" if verified_path else "unknown",
+        }
+        for meta_key in ("frameId", "targetId", "browserContextId"):
+            meta_val = info.get(meta_key)
+            if isinstance(meta_val, str) and meta_val:
+                entry[meta_key] = meta_val
+        if received_bytes is not None:
+            entry["receivedBytes"] = received_bytes
+        if total_bytes is not None:
+            entry["totalBytes"] = total_bytes
+        if verified_path:
+            try:
+                size, sha256_hex, skip_reason = hash_file_bounded(verified_path, max_bytes=max_hash_bytes)
+                size_mismatch = (
+                    (isinstance(total_bytes, int) and total_bytes > 0 and size != total_bytes)
+                    or (isinstance(received_bytes, int) and received_bytes > 0 and size != received_bytes)
+                )
+                if size_mismatch:
+                    entry["pathStatus"] = "unknown"
+                else:
+                    entry["path"] = verified_path
+                    entry["size"] = size
+                    if sha256_hex is not None:
+                        entry["sha256"] = sha256_hex
+                    if skip_reason is not None:
+                        entry["hashSkippedReason"] = skip_reason
+            except OSError:
+                entry.pop("path", None)
+                entry["pathStatus"] = "unknown"
+        receipts.append(entry)
+    return receipts
+
+
+def click_selector(
+    client: CdpClient,
+    session_id: str,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    selector = str(args.get("selector") or "").strip()
+    if not selector:
+        return {"ok": False, "clicked": False, "error": "selector is required"}
+    ensure_helpers(client, session_id)
+    try:
+        res = eval_json(
+            client,
+            session_id,
+            f"""(() => {{
+                const sel = {json.dumps(selector)};
+                let el = null;
+                if (/^e[0-9a-f]+$/i.test(sel)) {{
+                    if (window.__rakazoPageBrowser && typeof window.__rakazoPageBrowser.resolve === "function") {{
+                        el = window.__rakazoPageBrowser.resolve(sel);
+                    }}
+                    if (!el || el.isConnected === false) {{
+                        return {{ ok: false, clicked: false, error: `Stale element ref: ${{sel}}` }};
+                    }}
+                }} else {{
+                    try {{
+                        el = document.querySelector(sel);
+                    }} catch (err) {{
+                        return {{ ok: false, clicked: false, error: `Invalid selector: ${{sel}}` }};
+                    }}
+                    if (!el || el.isConnected === false) {{
+                        return {{ ok: false, clicked: false, error: `No element matches selector: ${{sel}}` }};
+                    }}
+                }}
+                const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+                if (style && (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")) {{
+                    return {{ ok: false, clicked: false, error: `Element has no visible box: ${{sel}}` }};
+                }}
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) {{
+                    return {{ ok: false, clicked: false, error: `Element has no visible box: ${{sel}}` }};
+                }}
+                let cur = el;
+                while (cur) {{
+                    if (
+                        (cur.hasAttribute && cur.hasAttribute("disabled")) ||
+                        (cur.getAttribute && cur.getAttribute("aria-disabled") === "true") ||
+                        (cur.matches && cur.matches(":disabled")) ||
+                        cur.disabled === true
+                    ) {{
+                        return {{ ok: false, clicked: false, error: `Element is disabled: ${{sel}}` }};
+                    }}
+                    cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host);
+                }}
+                el.focus();
+                el.click();
+                return {{
+                    ok: true,
+                    clicked: true,
+                    url: location.href,
+                    title: (document.title || "").slice(0, 200),
+                }};
+            }})()""",
+        )
+        if isinstance(res, dict):
+            return res
+        return {"ok": False, "clicked": False, "error": "click_selector returned non-object"}
+    except Exception as exc:
+        return {"ok": False, "clicked": False, "error": str(exc)}
+
+
+SENSITIVE_JSON_KEY_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "api_key",
+    "apikey",
+    "client_secret",
+    "private_key",
+    "session_id",
+    "sessionid",
+    "otp",
+    "totp",
+)
+MAX_HARVEST_ITEM_BYTES = 16 * 1024
+MAX_HARVEST_TOTAL_BYTES = 64 * 1024
+
+
+def redact_sensitive_json(value: Any, depth: int = 0) -> Any:
+    if depth > 12:
+        return "[TRUNCATED_DEPTH]"
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for k, v in value.items():
+            key_str = str(k)
+            key_lower = key_str.lower()
+            if any(marker in key_lower for marker in SENSITIVE_JSON_KEY_SUBSTRINGS):
+                sanitized[key_str] = "[REDACTED]"
+            else:
+                sanitized[key_str] = redact_sensitive_json(v, depth + 1)
+        return sanitized
+    if isinstance(value, list):
+        return [redact_sensitive_json(item, depth + 1) for item in value[:100]]
+    if isinstance(value, str) and len(value) > 4000:
+        return value[:4000] + "...[TRUNCATED]"
+    return value
+
+
+def materialize_api_entries(client: CdpClient, session_id: str) -> list[dict[str, Any]]:
+    store = getattr(client, "_api_responses", None)
+    harvested = getattr(client, "_harvested_apis", None)
+    if not isinstance(harvested, list):
+        harvested = []
+        setattr(client, "_harvested_apis", harvested)
+    if not isinstance(store, dict):
+        return harvested
+
+    pending_entries: list[dict[str, Any]] = []
+    for key in (session_id, ""):
+        bucket = store.get(key)
+        if isinstance(bucket, list) and bucket:
+            pending_entries.extend(bucket)
+            store[key] = []
+
+    for item in pending_entries:
+        if not isinstance(item, dict):
+            continue
+        u = str(item.get("url") or "")
+        req_id = str(item.get("requestId") or "")
+        body_data: Any = item.get("data")
+        if body_data is None and req_id:
+            try:
+                raw_body = client.call(
+                    "Network.getResponseBody",
+                    {"requestId": req_id},
+                    session_id=session_id,
+                    timeout_s=5.0,
+                )
+                body_str = str(raw_body.get("body") or "")
+                if raw_body.get("base64Encoded"):
+                    body_str = base64.b64decode(body_str).decode("utf-8", errors="replace")
+                try:
+                    body_data = json.loads(body_str)
+                except Exception:
+                    body_data = body_str[:4000]
+            except Exception:
+                body_data = None
+        if body_data is not None:
+            body_data = redact_sensitive_json(body_data)
+            try:
+                encoded = json.dumps(body_data, ensure_ascii=False)
+                if len(encoded.encode("utf-8")) > MAX_HARVEST_ITEM_BYTES:
+                    body_data = {
+                        "truncated": True,
+                        "preview": encoded[:4000],
+                    }
+            except Exception:
+                body_data = str(body_data)[:4000]
+        record: dict[str, Any] = {
+            "url": u,
+            "status": item.get("status"),
+            "mimeType": item.get("mimeType"),
+            **({"data": body_data} if body_data is not None else {}),
+        }
+        harvested.append(record)
+    if len(harvested) > 50:
+        del harvested[:-50]
+    if hasattr(client, "save_persisted_state"):
+        client.save_persisted_state()
+    return harvested
+
+
+def harvest_json_apis(
+    client: CdpClient,
+    session_id: str,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    url_filter = str(args.get("urlFilter") or "").strip().lower()
+    max_items = min(max(int(args.get("maxItems") or 10), 1), 50)
+    entries = materialize_api_entries(client, session_id)
+    matched: list[dict[str, Any]] = []
+    total_bytes = 0
+    for item in reversed(entries):
+        if not isinstance(item, dict):
+            continue
+        u = str(item.get("url") or "")
+        if url_filter and url_filter not in u.lower():
+            continue
+        sanitized_item: dict[str, Any] = {
+            "url": u,
+            "status": item.get("status"),
+            "mimeType": item.get("mimeType"),
+        }
+        if "data" in item and item["data"] is not None:
+            sanitized_item["data"] = redact_sensitive_json(item["data"])
+        item_bytes = len(json.dumps(sanitized_item, ensure_ascii=False).encode("utf-8"))
+        if matched and total_bytes + item_bytes > MAX_HARVEST_TOTAL_BYTES:
+            break
+        total_bytes += item_bytes
+        matched.append(sanitized_item)
+        if len(matched) >= max_items:
+            break
+    return {"ok": True, "apis": matched}
+
+
+def bezier_pointer_points(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    steps: int = 12,
+) -> list[tuple[int, int]]:
+    steps = max(2, min(steps, 40))
+    dx = x1 - x0
+    dy = y1 - y0
+    cx1 = x0 + dx * 0.28 - dy * 0.12
+    cy1 = y0 + dy * 0.18 + dx * 0.08
+    cx2 = x0 + dx * 0.72 + dy * 0.09
+    cy2 = y0 + dy * 0.84 - dx * 0.06
+    points: list[tuple[int, int]] = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        inv = 1.0 - t
+        bx = (
+            (inv**3) * x0
+            + 3 * (inv**2) * t * cx1
+            + 3 * inv * (t**2) * cx2
+            + (t**3) * x1
+        )
+        by = (
+            (inv**3) * y0
+            + 3 * (inv**2) * t * cy1
+            + 3 * inv * (t**2) * cy2
+            + (t**3) * y1
+        )
+        points.append((int(round(bx)), int(round(by))))
+    return points
+
+
+STEALTH_INIT_SCRIPT = r"""
+(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    if (!window.chrome) {
+      window.chrome = { runtime: {} };
+    }
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'th-TH', 'th'] });
+  } catch {}
+})();
+"""
+
+
+def apply_stealth_evasion(client: CdpClient, session_id: str) -> dict[str, Any]:
+    client.call(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": STEALTH_INIT_SCRIPT},
+        session_id=session_id,
+    )
+    try:
+        client.call(
+            "Runtime.evaluate",
+            {"expression": STEALTH_INIT_SCRIPT, "returnByValue": True},
+            session_id=session_id,
+        )
+    except Exception:
+        pass
+    return {"ok": True, "stealth": True}
+
+
+def observe_challenge_state(client: CdpClient, session_id: str) -> dict[str, Any] | None:
+    try:
+        ensure_world(client, session_id)
+        info = eval_json(
+            client,
+            session_id,
+            r"""(() => {
+              const tokenInputs = Array.from(
+                document.querySelectorAll(
+                  '[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]'
+                )
+              );
+              const tokens = tokenInputs
+                .map((el) => (typeof el.value === "string" ? el.value.trim() : ""))
+                .filter((v) => v.length > 0);
+              const hasToken = tokens.length > 0;
+              const tokenValue = tokens.join("|");
+              const hasChallengeDom = Boolean(
+                document.querySelector(
+                  '#challenge-running, #challenge-form, #cf-challenge-running, iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .cf-turnstile, .g-recaptcha, .h-captcha'
+                )
+              );
+              let httpStatus = null;
+              try {
+                const nav = performance.getEntriesByType("navigation")[0];
+                if (nav && typeof nav.responseStatus === "number" && nav.responseStatus > 0) {
+                  httpStatus = nav.responseStatus;
+                }
+              } catch (e) {}
+              const title = (document.title || "").slice(0, 200);
+              const bodySnippet = (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 1000);
+              return { hasToken, tokenValue, hasChallengeDom, httpStatus, title, bodySnippet, url: location.href };
+            })()""",
+        )
+        return info if isinstance(info, dict) else None
+    except Exception:
+        return None
+
+
+def _is_error_page_observation(
+    client: CdpClient,
+    session_id: str,
+    obs: dict[str, Any],
+) -> bool:
+    url = str(obs.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return True
+    obs_status = obs.get("httpStatus")
+    if isinstance(obs_status, int) and not isinstance(obs_status, bool) and obs_status >= 400:
+        return True
+    doc_resp = find_document_response(client, session_id, None, None)
+    if isinstance(doc_resp, dict):
+        cdp_status = doc_resp.get("status")
+        if isinstance(cdp_status, int) and not isinstance(cdp_status, bool) and cdp_status >= 400:
+            return True
+    if find_document_failure(client, session_id, None, None) is not None:
+        return True
+    combined = f"{obs.get('title') or ''}\n{obs.get('bodySnippet') or ''}".lower()
+    error_markers = (
+        "502 bad gateway",
+        "503 service temporarily unavailable",
+        "504 gateway time-out",
+        "500 internal server error",
+        "403 forbidden",
+        "404 not found",
+        "this site can’t be reached",
+        "this site can't be reached",
+        "err_connection_",
+        "err_name_not_resolved",
+    )
+    return any(marker in combined for marker in error_markers)
+
+
+def solve_challenge(
+    client: CdpClient,
+    session_id: str,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    target_x = args.get("x")
+    target_y = args.get("y")
+    if not (isinstance(target_x, (int, float)) and isinstance(target_y, (int, float))):
+        ensure_helpers(client, session_id)
+        box = eval_json(
+            client,
+            session_id,
+            r"""(() => {
+              const sel = 'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"], .cf-turnstile, #challenge-stage input[type="checkbox"]';
+              const el = document.querySelector(sel);
+              if (!el) return null;
+              const r = el.getBoundingClientRect();
+              if (r.width <= 0 || r.height <= 0) return null;
+              return { x: Math.round(r.left + Math.min(32, r.width / 2)), y: Math.round(r.top + r.height / 2) };
+            })()""",
+        )
+        if not isinstance(box, dict):
+            return {
+                "ok": False,
+                "dispatched": False,
+                "status": "no_widget",
+                "solved": False,
+                "businessGoalVerified": False,
+                "requiresTakeover": True,
+                "fallback": "request_takeover",
+                "error": "No challenge widget located on page",
+            }
+        target_x = int(box["x"])
+        target_y = int(box["y"])
+    pre = observe_challenge_state(client, session_id)
+    start_x = int(args.get("startX") or max(10, int(target_x) - 140))
+    start_y = int(args.get("startY") or max(10, int(target_y) - 90))
+    trajectory = bezier_pointer_points(start_x, start_y, float(target_x), float(target_y), steps=12)
+    for px, py in trajectory:
+        client.call(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseMoved", "x": px, "y": py, "button": "none"},
+            session_id=session_id,
+        )
+    fx, fy = trajectory[-1]
+    client.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mousePressed", "x": fx, "y": fy, "button": "left", "clickCount": 1},
+        session_id=session_id,
+    )
+    client.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mouseReleased", "x": fx, "y": fy, "button": "left", "clickCount": 1},
+        session_id=session_id,
+    )
+    settle_ms = int(args.get("settleMs", 250))
+    if settle_ms > 0:
+        time.sleep(min(settle_ms, 5000) / 1000.0)
+    post = observe_challenge_state(client, session_id)
+    if isinstance(post, dict):
+        if _is_error_page_observation(client, session_id, post):
+            return {
+                "ok": False,
+                "dispatched": True,
+                "status": "navigation_error",
+                "solved": False,
+                "businessGoalVerified": False,
+                "requiresTakeover": True,
+                "fallback": "request_takeover",
+                "clickedAt": {"x": fx, "y": fy},
+                "trajectoryPoints": len(trajectory),
+                "error": "Page navigated to an error page during challenge verification; request user takeover.",
+            }
+        post_has_token = bool(post.get("hasToken"))
+        post_token_val = str(post.get("tokenValue") or "")
+        pre_has_token = bool(pre.get("hasToken")) if isinstance(pre, dict) else False
+        pre_token_val = str(pre.get("tokenValue") or "") if isinstance(pre, dict) else ""
+        # A pre-existing token that did not change after clicking is stale.
+        stale_preexisting_token = pre_has_token and (
+            not post_has_token or post_token_val == pre_token_val
+        )
+        fresh_token = post_has_token and not stale_preexisting_token
+        post_has_dom = bool(post.get("hasChallengeDom"))
+        post_text_challenge = detect_challenge_page(
+            str(post.get("title") or ""),
+            str(post.get("bodySnippet") or ""),
+            False,
+            post.get("httpStatus") if isinstance(post.get("httpStatus"), int) else None,
+        )
+        still_challenged = (
+            stale_preexisting_token
+            or post_has_dom
+            or (not fresh_token and post_text_challenge is not None)
+        )
+        if not still_challenged and (fresh_token or not post_has_dom):
+            return {
+                "ok": True,
+                "dispatched": True,
+                "status": "verified",
+                "solved": True,
+                "businessGoalVerified": False,
+                "clickedAt": {"x": fx, "y": fy},
+                "trajectoryPoints": len(trajectory),
+            }
+        return {
+            "ok": False,
+            "dispatched": True,
+            "status": "still_challenged",
+            "solved": False,
+            "businessGoalVerified": False,
+            "requiresTakeover": True,
+            "fallback": "request_takeover",
+            "clickedAt": {"x": fx, "y": fy},
+            "trajectoryPoints": len(trajectory),
+            "error": "Challenge remains active after click; request user takeover.",
+        }
+    return {
+        "ok": False,
+        "dispatched": True,
+        "status": "unknown",
+        "solved": False,
+        "businessGoalVerified": False,
+        "requiresTakeover": True,
+        "fallback": "request_takeover",
+        "clickedAt": {"x": fx, "y": fy},
+        "trajectoryPoints": len(trajectory),
+        "error": "Challenge state could not be verified after click; request user takeover.",
+    }
+
+
+def activate_selected_page(client: CdpClient, session_id: str) -> None:
+    # A persisted selected tab can be hidden after Chromium restores a profile.
+    # Keep product observations/actions on the page shown for human takeover.
+    client.call("Page.bringToFront", session_id=session_id, timeout_s=3.0)
+    result = client.call(
+        "Runtime.evaluate",
+        {"expression": 'document.visibilityState === "visible"', "returnByValue": True},
+        session_id=session_id,
+        timeout_s=3.0,
+    )
+    if result.get("exceptionDetails") or result.get("result", {}).get("value") is not True:
+        raise RuntimeError("Selected browser tab is not visible; refusing a hidden-page operation")
+
+
+def flush_and_persist_state(client: CdpClient, session_id: str | None = None) -> None:
+    if session_id:
+        try:
+            if getattr(client, "_sock", None) is not None:
+                time.sleep(0.25)
+                client.call(
+                    "Runtime.evaluate",
+                    {"expression": "1", "returnByValue": True},
+                    session_id=session_id,
+                    timeout_s=2.0,
+                )
+            materialize_api_entries(client, session_id)
+        except Exception:
+            pass
+    if hasattr(client, "save_persisted_state"):
+        client.save_persisted_state()
+
+
+def exit_when_stdin_closes() -> None:
+    """The supervisor owns this pipe; losing it cancels this helper, not Chromium."""
+    try:
+        while os.read(0, 1024):
+            pass
+    finally:
+        os._exit(130)
+
+
+def read_stdin_line() -> str:
+    """Read one line from fd 0 unbuffered, leaving the rest of stdin for the EOF watcher."""
+    data = bytearray()
+    while len(data) < 1_048_576:
+        chunk = os.read(0, 1)
+        if not chunk or chunk == b"\n":
+            break
+        data += chunk
+    return data.decode("utf-8")
+
+
+def run(argv: list[str]) -> int:
+    stdin_args = (
+        read_stdin_line() if os.environ.get("RAKAZO_BROWSER_ARGS_STDIN") == "1" else None
+    )
+    if os.environ.get("RAKAZO_BROWSER_WATCH_STDIN") == "1":
+        threading.Thread(target=exit_when_stdin_closes, daemon=True).start()
+    if len(argv) < 2:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "usage: rakazo-page-browser <command> [json-args]",
+                    "fallback": "computer_act",
+                }
+            )
+        )
+        return 2
+    command = argv[1]
+    args: dict[str, Any] = {}
+    raw_args = stdin_args if stdin_args is not None else (argv[2] if len(argv) >= 3 else "")
+    if raw_args.strip():
+        args = json.loads(raw_args)
+    evidence = BrowserEvidence(os.environ.get("RAKAZO_BROWSER_RUN_ID"),
+        os.environ.get("RAKAZO_BROWSER_EXECUTION_ID"), command)
+    port = cdp_port()
+    mutation_may_have_run = False
+    try:
+        wait_for_cdp(port)
+        ws_url = discover_ws_url(port)
+        client = CdpClient(ws_url, state_file=default_state_file(port))
+        client._evidence = evidence
+        client.connect()
+        session_id: str | None = None
+        try:
+            session_id = attach_page(client)
+            activate_selected_page(client, session_id)
+            evidence_call(client, "selected", session_id, getattr(client, "_active_target_id", None))
+            if command == "navigate":
+                result = navigate(client, session_id, str(args.get("url") or ""))
+            elif command == "snapshot":
+                result = snapshot(client, session_id)
+            elif command == "act":
+                actions = args.get("actions")
+                if not isinstance(actions, list):
+                    raise RuntimeError("actions must be an array")
+                mutation_may_have_run = True
+                result = act(client, session_id, actions)
+            elif command == "click_selector":
+                result = click_selector(client, session_id, args)
+            elif command == "downloads":
+                wait_ms_raw = args.get("waitForCompletionMs")
+                wait_ms = (
+                    min(30_000, max(0, int(wait_ms_raw)))
+                    if isinstance(wait_ms_raw, int) and not isinstance(wait_ms_raw, bool)
+                    else 0
+                )
+                wait_deadline = time.monotonic() + (wait_ms / 1000.0)
+                while True:
+                    flush_and_persist_state(client, session_id)
+                    if time.monotonic() >= wait_deadline:
+                        break
+                    has_in_progress = any(
+                        isinstance(d, dict) and d.get("state") == "inProgress"
+                        for d in getattr(client, "_downloads", {}).values()
+                    )
+                    if not has_in_progress:
+                        break
+                    time.sleep(0.2)
+                result = {
+                    "ok": True,
+                    "downloads": collect_download_receipts(
+                        client,
+                        args.get("downloadDir"),
+                        browser_context_id=args.get("browserContextId"),
+                        target_id=args.get("targetId"),
+                        frame_id=args.get("frameId"),
+                    ),
+                }
+            elif command == "clear_origin_storage":
+                result = clear_origin_storage(client, session_id, args)
+            elif command == "harvest_json":
+                result = harvest_json_apis(client, session_id, args)
+            elif command == "solve_challenge":
+                result = solve_challenge(client, session_id, args)
+            elif command == "stealth":
+                result = apply_stealth_evasion(client, session_id)
+            elif command == "tab_list":
+                tabs = list_browser_tabs(client, active_session_id=session_id)
+                result = {
+                    "ok": True,
+                    "activeTargetId": getattr(client, "_active_target_id", None),
+                    "tabs": tabs,
+                    "targetHistory": getattr(client, "_target_history", []),
+                    "staleRefRejections": getattr(client, "_stale_ref_rejections", []),
+                }
+            elif command == "tab_switch":
+                target_tid = str(args.get("targetId") or "").strip()
+                if not target_tid:
+                    raise RuntimeError("targetId is required for tab_switch")
+                session_id = switch_to_target(client, target_tid)
+                result = snapshot(client, session_id)
+            elif command == "tab_close":
+                tabs = list_browser_tabs(client)
+                target_tid = str(args.get("targetId") or "").strip()
+                url_sub = str(args.get("urlIncludes") or "").strip().lower()
+                title_sub = str(args.get("titleIncludes") or "").strip().lower()
+                allow_last = bool(args.get("allowLastTab", False))
+
+                if not target_tid and (url_sub or title_sub):
+                    matches = [t for t in tabs
+                        if (not url_sub or url_sub in str(t.get("url") or "").lower()) and
+                           (not title_sub or title_sub in str(t.get("title") or "").lower())]
+                    if len(matches) != 1:
+                        raise RuntimeError("Tab selector must match exactly one target; no close was sent")
+                    target_tid = str(matches[0].get("targetId") or "")
+
+                if not target_tid:
+                    # Default to active target if it is a secondary/child tab
+                    act_tid = getattr(client, "_active_target_id", "") or ""
+                    opener_map = getattr(client, "_opener_map", {})
+                    if act_tid and (act_tid in opener_map or len(tabs) > 1):
+                        target_tid = act_tid
+
+                if not target_tid:
+                    raise RuntimeError("targetId is required for tab_close")
+
+                if len(tabs) <= 1 and not allow_last:
+                    raise RuntimeError("Refusing to close the last remaining browser tab (allowLastTab=False)")
+
+                opener_map = getattr(client, "_opener_map", {})
+                if not any(t.get("targetId") == target_tid for t in tabs):
+                    raise RuntimeError("Requested browser target was not present before close")
+                opener_tid = opener_map.get(target_tid) if isinstance(opener_map, dict) else None
+                mutation_may_have_run = True
+                client.call("Target.closeTarget", {"targetId": target_tid})
+                # CDP's deprecated success field is not an outcome oracle. Verify
+                # target removal and every survivor from the post-close inventory.
+                if getattr(client, "_active_target_id", None) == target_tid:
+                    rem_tabs = [t for t in list_browser_tabs(client) if t.get("targetId") != target_tid]
+                    fallback_tid = opener_tid if any(t.get("targetId") == opener_tid for t in rem_tabs) else (rem_tabs[0]["targetId"] if rem_tabs else None)
+                    client._active_target_id = fallback_tid
+                    if fallback_tid:
+                        try:
+                            client.call("Target.activateTarget", {"targetId": fallback_tid})
+                        except Exception:
+                            pass
+                time.sleep(0.15)
+                rem_tabs = list_browser_tabs(client)
+                remaining_ids = {t.get("targetId") for t in rem_tabs}
+                if target_tid in remaining_ids:
+                    raise RuntimeError("Target.closeTarget acknowledged but target is still present")
+                survivors = {t.get("targetId") for t in tabs if t.get("targetId") != target_tid}
+                if not survivors.issubset(remaining_ids):
+                    raise RuntimeError("Another browser target disappeared during close; preservation is unverified")
+                if isinstance(opener_map, dict):
+                    opener_map.pop(target_tid, None)
+                result = {
+                    "ok": True,
+                    "closedTargetId": target_tid,
+                    "activeTargetId": getattr(client, "_active_target_id", None),
+                    "tabs": rem_tabs,
+                }
+            elif command == "scroll":
+                ensure_helpers(client, session_id)
+                direction = str(args.get("direction") or "down")
+                amount = int(args.get("amount") or 500)
+                selector = str(args.get("selector") or "")
+                eval_json(
+                    client,
+                    session_id,
+                    f"window.__rakazoPageBrowser.scroll({json.dumps(direction)}, {json.dumps(amount)}, {json.dumps(selector)})",
+                )
+                result = snapshot(client, session_id)
+            else:
+                result = {
+                    "ok": False,
+                    "error": f"unknown command: {command}",
+                    "fallback": "computer_act",
+                }
+                print_browser_result(result, evidence)
+                return 2
+            flush_and_persist_state(client, session_id)
+            print_browser_result(result, evidence)
+            return 0  # Structured failures preserve partial action progress.
+        finally:
+            flush_and_persist_state(client, session_id)
+            client.close()
+    except Exception as exc:  # noqa: BLE001
+        print_browser_result({"ok": False, "error": str(exc), "fallback": "computer_act",
+                              "uncertain": mutation_may_have_run}, evidence)
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv))

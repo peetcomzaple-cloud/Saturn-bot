@@ -1,0 +1,97 @@
+{
+  "expo": {
+    "name": "Saturn bot",
+    "slug": "saturn-bot",
+    "scheme": "rakazo",
+    "version": "1.0.5",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "icon": "./assets/saturn-logo.png",
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/saturn-logo.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#050506"
+        }
+      ],
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-audio",
+        {
+          "enableBackgroundPlayback": false,
+          "microphonePermission": "Saturn bot uses the microphone for voice calls with your bots."
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "speechRecognitionPermission": "Saturn bot turns your speech into messages during voice calls.",
+          "microphonePermission": "Saturn bot uses the microphone for voice calls with your bots."
+        }
+      ],
+      "expo-localization",
+      "@react-native-vector-icons/ionicons",
+      "@react-native-vector-icons/material-design-icons",
+      [
+        "expo-notifications",
+        {
+          "color": "#2965EC"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Saturn bot uses your photo library so you can attach images to a bot message.",
+          "cameraPermission": "Saturn bot uses the camera so you can attach photos to a bot message.",
+          "microphonePermission": "Saturn bot uses the microphone for voice calls with your bots."
+        }
+      ],
+      "expo-sharing",
+      "./plugins/with-worklets-headers",
+      "./plugins/with-scene-lifecycle"
+    ],
+    "ios": {
+      "bundleIdentifier": "dev.saturnbot.app",
+      "buildNumber": "1",
+      "supportsTablet": false,
+      "icon": "../../packages/ui-tokens/assets/Saturn.icon",
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSCameraUsageDescription": "Saturn bot uses the camera so you can attach photos to a bot message.",
+        "NSPhotoLibraryUsageDescription": "Saturn bot uses your photo library so you can attach images to a bot message.",
+        "NSLocalNetworkUsageDescription": "Saturn bot connects to a self-hosted Saturn bot server on your local network.",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "dev.saturnbot.app",
+      "versionCode": 10,
+      "softwareKeyboardLayoutMode": "resize",
+      "icon": "./assets/saturn-logo.png",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/saturn-logo.png",
+        "backgroundColor": "#050506"
+      }
+    },
+    "web": {
+      "favicon": "./assets/saturn-logo.png"
+    },
+    "extra": {
+      "router": {},
+      "supportsRTL": true
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "enabled": false
+    }
+  }
+}

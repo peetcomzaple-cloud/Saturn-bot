@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="th" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Rakazo Computer</title>
+  <link rel="stylesheet" href="/assets/tokens.css">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header><strong>Rakazo Computer</strong><span id="status"><i id="dot"></i><span id="status-text">พร้อม</span></span><button id="stop" class="danger">หยุด</button></header>
+  <main>
+    <section class="chat" aria-label="แชต">
+      <div id="messages" aria-live="polite"></div>
+      <div id="approvals"></div>
+      <div id="error" role="alert"></div>
+      <form id="chat-form"><label class="sr-only" for="command">คำสั่ง</label><textarea id="command" rows="2" placeholder="list files หรือ open https://example.com"></textarea><button type="submit">ส่ง</button></form>
+    </section>
+    <section class="computer" aria-label="จอคอมพิวเตอร์">
+      <nav aria-label="ควบคุมจอ"><button id="view">ดูจอ</button><button id="take-control">เข้าควบคุม</button><button id="return-control">คืนให้บอต</button></nav>
+      <div id="screen" aria-label="เดสก์ท็อป 1280 × 800"></div>
+    </section>
+  </main>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

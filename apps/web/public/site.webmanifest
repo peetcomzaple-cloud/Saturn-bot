@@ -1,0 +1,17 @@
+{
+  "name": "Saturn bot",
+  "short_name": "Saturn",
+  "description": "Your AI team. Your models. Your workspace.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050506",
+  "theme_color": "#050506",
+  "icons": [
+    {
+      "src": "/saturn-logo.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

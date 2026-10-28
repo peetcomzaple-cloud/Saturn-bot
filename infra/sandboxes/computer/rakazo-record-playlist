@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Overnight multi-clip screen+audio recorder & stream harvester with watchdog state, MP3 conversion, and Rclone cloud upload."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+DEFAULT_STATUS_FILE = "/tmp/rakazo/playlist-recorder-status.json"
+_ACTIVE_FFMPEG_PROC: subprocess.Popen[str] | None = None
+_STOP_REQUESTED = False
+
+
+def _terminate_active_ffmpeg() -> None:
+    global _ACTIVE_FFMPEG_PROC
+    proc = _ACTIVE_FFMPEG_PROC
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    _ACTIVE_FFMPEG_PROC = None
+
+
+def write_status(status_path: Path, payload: dict[str, Any]) -> None:
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    payload["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    tmp_path = status_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(status_path)
+
+
+def load_status(status_path: Path) -> dict[str, Any]:
+    if not status_path.exists():
+        return {}
+    try:
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def parse_page_browser_output(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+        return {
+            "ok": False,
+            "error": (proc.stderr or "").strip() or f"rakazo-page-browser exited with {proc.returncode}",
+        }
+    try:
+        parsed = json.loads(stdout.splitlines()[-1])
+        if isinstance(parsed, dict):
+            return parsed
+        return {"ok": False, "error": "rakazo-page-browser returned non-object JSON"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Invalid JSON from rakazo-page-browser: {exc}"}
+
+
+def navigate_url(url: str, helper_bin: str = "rakazo-page-browser") -> dict[str, Any]:
+    if not shutil.which(helper_bin) and not os.path.isfile(helper_bin):
+        return {"ok": False, "error": f"{helper_bin} is not installed in PATH"}
+    proc = subprocess.run(
+        [helper_bin, "navigate", json.dumps({"url": url})],
+        capture_output=True,
+        text=True,
+    )
+    res = parse_page_browser_output(proc)
+    if proc.returncode != 0:
+        res["ok"] = False
+        res.setdefault("error", f"exit code {proc.returncode}")
+    return res
+
+
+def advance_next_clip(selector: str, helper_bin: str = "rakazo-page-browser") -> dict[str, Any]:
+    if not shutil.which(helper_bin) and not os.path.isfile(helper_bin):
+        return {"ok": False, "clicked": False, "error": f"{helper_bin} is not installed in PATH"}
+    proc = subprocess.run(
+        [helper_bin, "click_selector", json.dumps({"selector": selector})],
+        capture_output=True,
+        text=True,
+    )
+    res = parse_page_browser_output(proc)
+    if proc.returncode != 0 or res.get("clicked") is False:
+        res["ok"] = False
+        res.setdefault("error", f"click_selector failed (exit {proc.returncode})")
+    return res
+
+
+def convert_to_mp3(video_path: Path, mp3_path: Path) -> bool:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-q:a",
+        "2",
+        str(mp3_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode == 0 and mp3_path.exists() and mp3_path.stat().st_size > 0
+
+
+def has_live_pulse_source(audio_source: str) -> bool:
+    if not shutil.which("pactl"):
+        return False
+    try:
+        proc = subprocess.run(
+            ["pactl", "list", "short", "sources"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if proc.returncode != 0:
+            return False
+        stdout = proc.stdout or ""
+        return audio_source in stdout or bool(stdout.strip())
+    except Exception:
+        return False
+
+
+def record_screen_clip(
+    output_mp4: Path,
+    duration_sec: int,
+    display: str = ":1",
+    audio_source: str = "rakazo_sink.monitor",
+    resolution: str = "1280x800",
+    framerate: int = 24,
+) -> bool:
+    global _ACTIVE_FFMPEG_PROC
+    output_mp4.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "x11grab",
+        "-video_size",
+        resolution,
+        "-framerate",
+        str(framerate),
+        "-i",
+        display,
+    ]
+    if has_live_pulse_source(audio_source):
+        cmd.extend(["-f", "pulse", "-i", audio_source])
+    else:
+        cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
+    cmd.extend(
+        [
+            "-t",
+            str(duration_sec),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            str(output_mp4),
+        ]
+    )
+    if hasattr(subprocess, "Popen"):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _ACTIVE_FFMPEG_PROC = proc
+        try:
+            proc.communicate()
+            returncode = proc.returncode
+        finally:
+            _ACTIVE_FFMPEG_PROC = None
+    else:
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        returncode = completed.returncode
+    return returncode == 0 and output_mp4.exists() and output_mp4.stat().st_size > 0
+
+
+def upload_with_rclone(local_path: Path, rclone_dest: str) -> bool:
+    if not rclone_dest or not shutil.which("rclone"):
+        return False
+    proc = subprocess.run(
+        ["rclone", "copy", str(local_path), rclone_dest],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="rakazo-record-playlist",
+        description="Record multiple video clips sequentially with watchdog heartbeat, MP3 extraction, and optional Rclone upload.",
+    )
+    parser.add_argument("--urls", nargs="*", default=[], help="List of clip URLs to open and record in order.")
+    parser.add_argument("--urls-file", default="", help="Path to a text/JSON file listing clip URLs.")
+    parser.add_argument("--count", type=int, default=0, help="Number of clips to record if URLs are advanced in-page.")
+    parser.add_argument("--duration", type=int, default=60, help="Duration in seconds per clip for screen capture.")
+    parser.add_argument("--output-dir", default="/home/rakazo/recordings", help="Directory to store MP4 and MP3 outputs.")
+    parser.add_argument("--status-file", default=DEFAULT_STATUS_FILE, help="Watchdog heartbeat JSON path.")
+    parser.add_argument("--resume", action="store_true", help="Resume from the last unfinished clip in status-file.")
+    parser.add_argument("--rclone-dest", default="", help="Optional rclone destination (e.g. gdrive:RakazoRecordings).")
+    parser.add_argument("--next-selector", default="", help="Optional CSS selector or e<N> ref to click between clips.")
+    parser.add_argument("--status-only", action="store_true", help="Print current watchdog status JSON and exit.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = False
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    status_path = Path(args.status_file)
+    if args.status_only:
+        existing = load_status(status_path)
+        print(json.dumps(existing or {"status": "idle"}, ensure_ascii=False, indent=2))
+        return 0
+
+    urls: list[str] = list(args.urls or [])
+    if args.urls_file:
+        raw = Path(args.urls_file).read_text(encoding="utf-8").strip()
+        if raw.startswith("["):
+            urls.extend(str(u) for u in json.loads(raw) if str(u).strip())
+        else:
+            urls.extend(line.strip() for line in raw.splitlines() if line.strip())
+
+    total_clips = len(urls) if urls else max(1, args.count or 1)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = load_status(status_path) if args.resume else {}
+    completed_indices: set[int] = set(existing.get("completedIndices", []))
+    completed_clips: list[dict[str, Any]] = [
+        c for c in existing.get("clips", []) if isinstance(c, dict) and c.get("ok") is True
+    ]
+
+    status_payload: dict[str, Any] = {
+        "status": "running",
+        "pid": os.getpid(),
+        "totalClips": total_clips,
+        "currentClip": 0,
+        "completedIndices": sorted(completed_indices),
+        "clips": completed_clips,
+        "outputDir": str(out_dir),
+    }
+    write_status(status_path, status_payload)
+
+    def _handle_stop_signal(signum: int, _frame: Any) -> None:
+        global _STOP_REQUESTED
+        _STOP_REQUESTED = True
+        _terminate_active_ffmpeg()
+        status_payload["status"] = "stopped"
+        status_payload["stoppedBySignal"] = int(signum)
+        write_status(status_path, status_payload)
+
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _handle_stop_signal)
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
+
+    display = os.environ.get("DISPLAY", ":1")
+    aborted_by_navigation_error = False
+
+    try:
+        for idx in range(1, total_clips + 1):
+            if _STOP_REQUESTED:
+                break
+            if idx in completed_indices:
+                continue
+
+            clip_url = urls[idx - 1] if idx - 1 < len(urls) else ""
+            status_payload["currentClip"] = idx
+            status_payload["currentUrl"] = clip_url
+            write_status(status_path, status_payload)
+
+            nav_result: dict[str, Any] | None = None
+            if clip_url:
+                nav_result = navigate_url(clip_url)
+                if nav_result.get("ok") is not True:
+                    clip_record = {
+                        "index": idx,
+                        "url": clip_url,
+                        "mp4": None,
+                        "mp3": None,
+                        "uploaded": False,
+                        "ok": False,
+                        "navigationError": nav_result.get("error") or "Navigation failed",
+                    }
+                    completed_clips.append(clip_record)
+                    status_payload["clips"] = completed_clips
+                    write_status(status_path, status_payload)
+                    continue
+                time.sleep(2.0)
+
+            stem = f"clip_{idx:02d}"
+            mp4_path = out_dir / f"{stem}.mp4"
+            mp3_path = out_dir / f"{stem}.mp3"
+
+            recorded = record_screen_clip(
+                output_mp4=mp4_path,
+                duration_sec=max(1, args.duration),
+                display=display,
+            )
+            if _STOP_REQUESTED:
+                break
+            mp3_ok = convert_to_mp3(mp4_path, mp3_path) if recorded else False
+            uploaded = False
+            if args.rclone_dest and mp3_ok:
+                uploaded = upload_with_rclone(mp3_path, args.rclone_dest)
+
+            clip_ok = bool(recorded and mp3_ok and (uploaded if args.rclone_dest else True))
+            clip_record = {
+                "index": idx,
+                "url": (nav_result or {}).get("url") or clip_url,
+                "title": (nav_result or {}).get("title"),
+                "mp4": str(mp4_path) if recorded else None,
+                "mp3": str(mp3_path) if mp3_ok else None,
+                "uploaded": uploaded,
+                "ok": clip_ok,
+            }
+            if clip_ok:
+                completed_indices.add(idx)
+
+            if args.next_selector and idx < total_clips:
+                adv = advance_next_clip(args.next_selector)
+                clip_record["advancedNext"] = bool(adv.get("ok"))
+                if adv.get("ok") is not True:
+                    clip_record["advanceError"] = adv.get("error") or "Failed to advance to next clip"
+                    aborted_by_navigation_error = True
+                else:
+                    time.sleep(1.5)
+
+            completed_clips.append(clip_record)
+            status_payload["completedIndices"] = sorted(completed_indices)
+            status_payload["clips"] = completed_clips
+            write_status(status_path, status_payload)
+
+            if aborted_by_navigation_error or _STOP_REQUESTED:
+                break
+    finally:
+        _terminate_active_ffmpeg()
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
+
+    if _STOP_REQUESTED:
+        status_payload["status"] = "stopped"
+    else:
+        status_payload["status"] = (
+            "completed"
+            if len(completed_indices) == total_clips and not aborted_by_navigation_error
+            else "partial"
+        )
+    write_status(status_path, status_payload)
+    print(json.dumps(status_payload, ensure_ascii=False, indent=2))
+    return 0 if status_payload["status"] == "completed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

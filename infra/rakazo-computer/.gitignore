@@ -1,0 +1,8 @@
+.env
+.host-blocked-ips
+.rakazo-computer-owner
+workspace/
+web/tokens.css
+__pycache__/
+.pytest_cache/
+*.png
